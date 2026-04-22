@@ -1,0 +1,3 @@
+[submodule "LaMP"]
+	path = LaMP
+	url = https://github.com/LaMP-Benchmark/LaMP.git

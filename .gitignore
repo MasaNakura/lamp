@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+lamp-5/*
+exps/
+
+# Local experiment outputs (optional)
+checkpoints/
+eval_outputs/
+eval_out/
