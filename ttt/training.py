@@ -11,8 +11,9 @@ from itertools import cycle
 from typing import Any
 
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, AutoModelForSeq2SeqLM
+from transformers import AutoModelForSeq2SeqLM
 
 
 class ProfileSFTDataset(Dataset):

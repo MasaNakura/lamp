@@ -1,15 +1,18 @@
 """
 Global supervised training: LoRA + LaMP RAG prompts (same stage for **M3 and M4**).
 
-The saved checkpoint is used by `evaluate.py` for **M3** (inference only) and **M4**
+The saved checkpoint is used by `run_evaluate.py` for **M3** (inference only) and **M4**
 (inference after per-user test-time training). **M5** skips this script and starts
 from the base model with a fresh LoRA at evaluation time.
 
-Each training/validation example must include ``id``, ``input``, ``output``, and
-``profile``. Pass either merged JSON (``--train_json`` / ``--val_json``) or the
-official split files (``*_questions.json`` + ``*_outputs.json``); the latter are
-merged the same way as upstream ``LaMP/LaMP/utils/merge_with_rank.py``. Uses
-``GeneralSeq2SeqDataset`` and metrics from the LaMP submodule via ``util.lamp_paths``.
+**Training data** follows the LaMP release layout: ``train_questions.json`` (``input`` +
+``profile`` per ``id``) and ``train_outputs.json`` (gold ``output`` per ``id``), merged
+by id like ``LaMP/LaMP/utils/merge_with_rank.py`` (see ``LaMP/README.md`` and the
+benchmark site). Optional ``dev_questions.json`` / ``dev_outputs.json`` enable
+per-epoch validation; if omitted, training runs without a dev split (no
+``load_best_model_at_end``).
+
+Uses ``GeneralSeq2SeqDataset`` and metrics from the LaMP submodule via ``util.lamp_paths``.
 """
 from __future__ import annotations
 
@@ -49,27 +52,25 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--task", choices=["LaMP-5", "LaMP-7"], required=True)
     p.add_argument(
-        "--train_json",
-        default=None,
-        help="Merged LaMP JSON (array): each row has id, input, output, profile.",
-    )
-    p.add_argument(
-        "--val_json",
-        default=None,
-        help="Merged validation JSON (same schema as --train_json).",
-    )
-    p.add_argument(
         "--train_questions_json",
-        default=None,
-        help="LaMP split: inputs + profiles only (see benchmark *_questions.json).",
+        required=True,
+        help="LaMP train inputs + profiles (e.g. train_questions.json).",
     )
     p.add_argument(
         "--train_outputs_json",
-        default=None,
-        help="LaMP split: gold labels (list or {\"task\", \"golds\"}; see *_outputs.json).",
+        required=True,
+        help="LaMP train gold labels (e.g. train_outputs.json; list or {\"task\", \"golds\"}).",
     )
-    p.add_argument("--val_questions_json", default=None)
-    p.add_argument("--val_outputs_json", default=None)
+    p.add_argument(
+        "--dev_questions_json",
+        default=None,
+        help="Optional dev_questions.json for validation during training.",
+    )
+    p.add_argument(
+        "--dev_outputs_json",
+        default=None,
+        help="Optional dev_outputs.json (pair with --dev_questions_json).",
+    )
     p.add_argument("--base_model", default="google/flan-t5-small")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--cache_dir", default=None)
@@ -87,39 +88,52 @@ def parse_args():
     return p.parse_args()
 
 
-def _resolve_train_val_merged_paths(args) -> tuple[str, str]:
-    """Return (train_path, val_path) on disk for ``GeneralSeq2SeqDataset`` (single file each)."""
+def _write_merged_train_and_maybe_dev(
+    args,
+) -> tuple[str, str | None]:
+    """
+    Write merged JSON files for ``GeneralSeq2SeqDataset`` (upstream expects one path per split).
+
+    Returns (train_merged_path, dev_merged_path_or_None).
+    """
     merged_train = os.path.join(args.output_dir, "merged_train.json")
-    merged_val = os.path.join(args.output_dir, "merged_val.json")
+    merged_dev = os.path.join(args.output_dir, "merged_dev.json")
 
-    if args.train_json and args.val_json:
-        return args.train_json, args.val_json
-
-    pair_train = args.train_questions_json and args.train_outputs_json
-    pair_val = args.val_questions_json and args.val_outputs_json
-    if pair_train and pair_val:
-        train_rows = data_io.merge_questions_and_outputs(
-            args.train_questions_json, args.train_outputs_json
-        )
-        val_rows = data_io.merge_questions_and_outputs(
-            args.val_questions_json, args.val_outputs_json
-        )
-        with open(merged_train, "w", encoding="utf-8") as f:
-            json.dump(train_rows, f, ensure_ascii=False)
-        with open(merged_val, "w", encoding="utf-8") as f:
-            json.dump(val_rows, f, ensure_ascii=False)
-        return merged_train, merged_val
-
-    raise SystemExit(
-        "Provide either (--train_json and --val_json) merged files, or all four: "
-        "--train_questions_json, --train_outputs_json, --val_questions_json, --val_outputs_json."
+    train_rows = data_io.merge_questions_and_outputs(
+        args.train_questions_json, args.train_outputs_json, task=args.task
     )
+    data_io.warn_if_rows_look_like_unexpanded_placeholders(
+        train_rows,
+        task=args.task,
+        context=f"train: {args.train_questions_json} + {args.train_outputs_json}",
+    )
+    with open(merged_train, "w", encoding="utf-8") as f:
+        json.dump(train_rows, f, ensure_ascii=False)
+
+    has_dev = bool(args.dev_questions_json and args.dev_outputs_json)
+    if has_dev:
+        dev_rows = data_io.merge_questions_and_outputs(
+            args.dev_questions_json, args.dev_outputs_json, task=args.task
+        )
+        data_io.warn_if_rows_look_like_unexpanded_placeholders(
+            dev_rows,
+            task=args.task,
+            context=f"dev: {args.dev_questions_json} + {args.dev_outputs_json}",
+        )
+        with open(merged_dev, "w", encoding="utf-8") as f:
+            json.dump(dev_rows, f, ensure_ascii=False)
+        return merged_train, merged_dev
+
+    if args.dev_questions_json or args.dev_outputs_json:
+        raise SystemExit("Pass both --dev_questions_json and --dev_outputs_json, or neither.")
+
+    return merged_train, None
 
 
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    train_path, val_path = _resolve_train_val_merged_paths(args)
+    train_path, dev_path = _write_merged_train_and_maybe_dev(args)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, cache_dir=args.cache_dir, use_fast=False
@@ -145,14 +159,16 @@ def main():
     train_ds = GeneralSeq2SeqDataset(
         train_path, use_profile=True, task=args.task, create_prompt=prompt_generator
     )
-    val_ds = GeneralSeq2SeqDataset(
-        val_path, use_profile=True, task=args.task, create_prompt=prompt_generator
-    )
+    val_hf = None
+    if dev_path is not None:
+        val_ds = GeneralSeq2SeqDataset(
+            dev_path, use_profile=True, task=args.task, create_prompt=prompt_generator
+        )
+        val_hf = convert_to_hf_dataset(val_ds, cache_dir=args.cache_dir).map(
+            create_preprocessor(tokenizer, args.max_input_length), batched=True
+        )
 
     train_hf = convert_to_hf_dataset(train_ds, cache_dir=args.cache_dir).map(
-        create_preprocessor(tokenizer, args.max_input_length), batched=True
-    )
-    val_hf = convert_to_hf_dataset(val_ds, cache_dir=args.cache_dir).map(
         create_preprocessor(tokenizer, args.max_input_length), batched=True
     )
 
@@ -161,6 +177,7 @@ def main():
     )
     compute_metrics = create_metric_bleu_rouge_meteor(tokenizer=tokenizer)
 
+    use_eval = val_hf is not None
     targs = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -172,10 +189,10 @@ def main():
         generation_max_length=args.max_target_length,
         logging_steps=50,
         save_strategy="epoch",
-        eval_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="rouge-1",
-        greater_is_better=True,
+        eval_strategy="epoch" if use_eval else "no",
+        load_best_model_at_end=use_eval,
+        metric_for_best_model="rouge-1" if use_eval else None,
+        greater_is_better=True if use_eval else None,
         save_total_limit=2,
         seed=args.seed,
         report_to=[],
@@ -188,16 +205,17 @@ def main():
         eval_dataset=val_hf,
         tokenizer=tokenizer,
         data_collator=collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics if use_eval else None,
     )
     trainer.train()
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
-    metrics = trainer.evaluate(val_hf)
-    with open(os.path.join(args.output_dir, "val_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-    print(metrics)
+    if use_eval:
+        metrics = trainer.evaluate(val_hf)
+        with open(os.path.join(args.output_dir, "dev_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        print(metrics)
 
 
 if __name__ == "__main__":

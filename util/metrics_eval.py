@@ -24,6 +24,18 @@ def evaluate_strings(preds: list[str], refs: list[str]) -> dict[str, float]:
     return metric(preds, refs)
 
 
+def make_per_example_string_metric():
+    """Return ``score(pred, ref) -> dict`` sharing one load of sacrebleu/rouge/meteor (for verbose logging)."""
+    from metrics.generation_metrics import create_metric_bleu_rouge_meteor_chatgpt
+
+    metric = create_metric_bleu_rouge_meteor_chatgpt()
+
+    def score_one(pred: str, ref: str) -> dict[str, float]:
+        return metric([pred], [ref])
+
+    return score_one
+
+
 def write_lamp_predictions(task_underscore: str, pairs: list[tuple[str, str]], out_path: str) -> None:
     """
     Write {"task": "LaMP_5", "golds": [{"id": ..., "output": ...}]} style predictions
