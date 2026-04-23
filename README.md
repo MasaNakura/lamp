@@ -35,8 +35,8 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 
 ## GPU (CUDA)
 
-- **`run_evaluate.py`** uses CUDA when `torch.cuda.is_available()`; otherwise CPU.
-- **`train.py`** uses `Seq2SeqTrainer`, which picks CUDA automatically when available (unless you force CPU, e.g. `CUDA_VISIBLE_DEVICES=""`).
+- **`run_evaluate.py`** uses CUDA when `torch.cuda.is_available()`; otherwise CPU. The model and activations for generation run on that device. **`google/flan-t5-small`** is small, so wall time is often closer to CPU than you would see on a 7B model unless you raise **`--batch_size`** and use **`--fp16`** or **`--bf16`** (CUDA) to improve throughput. **`--verbose`** also runs extra metric passes per printed row (slow).
+- **`train.py`** uses `Seq2SeqTrainer`, which picks CUDA automatically when available (unless you force CPU, e.g. `CUDA_VISIBLE_DEVICES=""`). Optional **`--fp16`** or **`--bf16`** (CUDA) turns on mixed-precision training; raise **`--batch_size`** when VRAM allows.
 
 With LaMP’s **Contriever** retriever, upstream code may assume CUDA; the default here is **BM25** (CPU).
 
@@ -96,6 +96,7 @@ python3 train.py --task LaMP-5 \
 
 - For **LaMP-7** (personalized tweet paraphrasing), use `--task LaMP-7` and your LaMP-7 paths; profile items use `text` (see upstream `LaMP/LaMP` prompts).
 - `--ranked` if profiles are pre-ranked (LaMP `merge_with_rank.py` workflow).
+- On **CUDA**, add e.g. `--fp16 --batch_size 8` (or `--bf16` on GPUs that support bfloat16) for faster steps than plain fp32.
 
 ## Evaluate M1–M5
 
@@ -174,7 +175,8 @@ python3 run_evaluate.py --task LaMP-5 \
 |------|---------|
 | `--base_model` | Default `google/flan-t5-small`. |
 | `--num_retrieved`, `--retriever`, `--ranked` | RAG; align with training / LaMP ranking. |
-| `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching. |
+| `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching; on GPU prefer larger `--batch_size` with `--fp16` or `--bf16`. |
+| `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). |
 | `--user_field` | JSON field for user id when grouping test rows (M4/M5). |
 | `--cache_dir` | Hugging Face cache directory. |
 | `--verbose`, `--verbose_max_samples` | Print per-example inputs, profile counts, encoder preview, preds vs gold, and per-row BLEU/ROUGE/METEOR (cap rows with `verbose_max_samples`, `-1` = all). |

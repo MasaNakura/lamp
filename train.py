@@ -21,6 +21,8 @@ import json
 import os
 import sys
 
+import torch
+
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -79,7 +81,22 @@ def parse_args():
     p.add_argument("--ranked", action="store_true", help="Profile items are pre-ranked (LaMP merge step).")
     p.add_argument("--max_input_length", type=int, default=512)
     p.add_argument("--max_target_length", type=int, default=128)
-    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Per-device train/eval batch size; on GPU you can often increase this with --fp16/--bf16.",
+    )
+    p.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Mixed-precision training on CUDA (Trainer fp16 + loss scaling).",
+    )
+    p.add_argument(
+        "--bf16",
+        action="store_true",
+        help="bfloat16 training on CUDA when supported (often best on Ampere+). Mutually exclusive with --fp16.",
+    )
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--lora_r", type=int, default=8)
@@ -132,6 +149,15 @@ def _write_merged_train_and_maybe_dev(
 
 def main():
     args = parse_args()
+    if args.fp16 and args.bf16:
+        raise SystemExit("Use at most one of --fp16 and --bf16.")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
     os.makedirs(args.output_dir, exist_ok=True)
     train_path, dev_path = _write_merged_train_and_maybe_dev(args)
 
@@ -178,6 +204,14 @@ def main():
     compute_metrics = create_metric_bleu_rouge_meteor(tokenizer=tokenizer)
 
     use_eval = val_hf is not None
+    cuda = torch.cuda.is_available()
+    use_bf16 = bool(args.bf16 and cuda and torch.cuda.is_bf16_supported())
+    if args.bf16 and cuda and not use_bf16:
+        print("[train] --bf16 not supported on this GPU; training in fp32 (bf16 disabled).", file=sys.stderr)
+    use_fp16 = bool(args.fp16 and cuda)
+    if (args.fp16 or args.bf16) and not cuda:
+        print("[train] --fp16/--bf16 apply on CUDA only; training in fp32 on CPU.", file=sys.stderr)
+
     targs = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -196,6 +230,8 @@ def main():
         save_total_limit=2,
         seed=args.seed,
         report_to=[],
+        fp16=use_fp16,
+        bf16=use_bf16,
     )
 
     trainer = Seq2SeqTrainer(

@@ -73,7 +73,22 @@ def parse_args():
     p.add_argument("--ranked", action="store_true")
     p.add_argument("--max_input_length", type=int, default=512)
     p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Generation batch size; on GPU try 16–32 with --fp16/--bf16 for higher throughput.",
+    )
+    p.add_argument(
+        "--fp16",
+        action="store_true",
+        help="On CUDA: load the seq2seq model in float16 (usually faster and less VRAM than fp32).",
+    )
+    p.add_argument(
+        "--bf16",
+        action="store_true",
+        help="On CUDA: use bfloat16 when supported (often best on Ampere+). Incompatible with --fp16.",
+    )
     p.add_argument("--ttt_steps", type=int, default=30)
     p.add_argument("--ttt_lr", type=float, default=1e-4)
     p.add_argument("--user_field", default=None)
@@ -193,7 +208,26 @@ def merge_profiles(rows: list[dict]) -> list[dict]:
     return merged
 
 
-@torch.no_grad()
+def _infer_torch_dtype(device: torch.device, *, want_fp16: bool, want_bf16: bool) -> torch.dtype | None:
+    """Return ``torch_dtype`` for ``from_pretrained``, or ``None`` for default fp32."""
+    if device.type != "cuda":
+        if want_fp16 or want_bf16:
+            print(
+                "[run_evaluate] --fp16/--bf16 apply on CUDA only; running weights in fp32 on CPU.",
+                file=sys.stderr,
+            )
+        return None
+    if want_bf16:
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        print("[run_evaluate] --bf16 not supported on this GPU; using fp32.", file=sys.stderr)
+        return None
+    if want_fp16:
+        return torch.float16
+    return None
+
+
+@torch.inference_mode()
 def batched_generate(model, tokenizer, sources: list[str], device: torch.device, max_in: int, max_new: int):
     enc = tokenizer(
         sources,
@@ -202,7 +236,14 @@ def batched_generate(model, tokenizer, sources: list[str], device: torch.device,
         padding=True,
         return_tensors="pt",
     ).to(device)
-    out_ids = model.generate(**enc, max_new_tokens=max_new)
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    out_ids = model.generate(
+        **enc,
+        max_new_tokens=max_new,
+        pad_token_id=pad_id,
+    )
     return tokenizer.batch_decode(out_ids, skip_special_tokens=True)
 
 
@@ -223,8 +264,12 @@ def run_for_mode(
     batch_size: int,
     ttt_steps: int,
     ttt_lr: float,
+    torch_dtype: torch.dtype | None,
 ) -> list[tuple[str, str]]:
-    base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, cache_dir=cache_dir)
+    load_kw: dict = {"cache_dir": cache_dir}
+    if torch_dtype is not None:
+        load_kw["torch_dtype"] = torch_dtype
+    base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, **load_kw)
     if mode in ("m3", "m4"):
         if not adapter_dir:
             raise ValueError(f"{mode} requires --adapter_dir (global LoRA+RAG checkpoint).")
@@ -300,8 +345,18 @@ def run_for_mode(
 
 def main():
     args = parse_args()
+    if args.fp16 and args.bf16:
+        raise SystemExit("Use at most one of --fp16 and --bf16.")
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    torch_dtype = _infer_torch_dtype(device, want_fp16=args.fp16, want_bf16=args.bf16)
 
     merged = data_io.merge_questions_and_outputs(
         args.test_questions_json, args.test_outputs_json, task=args.task
@@ -356,6 +411,7 @@ def main():
             batch_size=args.batch_size,
             ttt_steps=args.ttt_steps,
             ttt_lr=args.ttt_lr,
+            torch_dtype=torch_dtype,
         )
         pred_map = {i: p for i, p in pairs}
         preds_ordered = [pred_map[i] for i in id_order]
