@@ -15,6 +15,8 @@ Models (paper storyboard):
   M3 Global LoRA + RAG (checkpoint from train.py; RAG prompt at decode)
   M4 Global LoRA + TTT (TTT on profile; decode uses **task input only**, no RAG—baseline TTT vs M3 RAG)
   M5 Clean TTT (same decode as M1/M4; fresh LoRA + TTT per user)
+  M6 TTT-E2E: seq2seq path uses ``ttt/e2e.py`` (T5 FFN-only inner). Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``;
+  optional ``--m6_mam_checkpoint`` from ``train_mam_meta.py``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
 """
@@ -34,7 +36,7 @@ if _ROOT not in sys.path:
 import torch
 from peft import PeftModel
 from tqdm import tqdm
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 
 from util.lamp_paths import ensure_lamp_on_path
 
@@ -64,9 +66,24 @@ def parse_args():
         required=True,
         help="Gold labels keyed by id (e.g. test_outputs.json; list or {\"task\", \"golds\"}).",
     )
-    p.add_argument("--base_model", default="google/flan-t5-small")
+    p.add_argument(
+        "--base_model",
+        default="google/flan-t5-small",
+        help="HF hub id, e.g. google/flan-t5-small or openai-community/gpt2-large.",
+    )
+    p.add_argument(
+        "--architecture",
+        choices=["auto", "seq2seq", "causal_lm"],
+        default="auto",
+        help="auto: use causal LM if base_model id contains 'gpt2'; else seq2seq (T5). "
+        "Causal LM is supported for m1 and m6 only.",
+    )
     p.add_argument("--adapter_dir", default=None, help="Checkpoint directory from train.py (M3/M4).")
-    p.add_argument("--modes", default="m1,m2,m3,m4,m5", help="Comma list among m1..m5.")
+    p.add_argument(
+        "--modes",
+        default="m1,m2,m3,m4,m5",
+        help="Comma list among m1..m6 (m6 = FFN-only TTT-E2E-style sim from ttt/e2e.py; base model).",
+    )
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_retrieved", type=int, default=3)
     p.add_argument("--retriever", default="bm25", choices=["bm25", "random", "recency"])
@@ -91,6 +108,13 @@ def parse_args():
     )
     p.add_argument("--ttt_steps", type=int, default=30)
     p.add_argument("--ttt_lr", type=float, default=1e-4)
+    p.add_argument(
+        "--m6_mam_checkpoint",
+        default=None,
+        help="For causal m6 only: optional ``.pt`` state_dict from ``train_mam_meta.py`` (TTTGPT2).",
+    )
+    p.add_argument("--m6_inner_window", type=int, default=256, help="Sliding NTP window for causal m6 inner loop.")
+    p.add_argument("--m6_inner_stride", type=int, default=128, help="Stride between windows for causal m6 inner loop.")
     p.add_argument("--user_field", default=None)
     p.add_argument("--output_dir", default="eval_outputs")
     p.add_argument(
@@ -128,7 +152,7 @@ def _encoder_source_for_mode(
     rag_prompt: Callable[[dict], str],
 ) -> str:
     """Same text the model sees (pre-tokenization) as in ``run_for_mode``."""
-    if mode in ("m1", "m4", "m5"):
+    if mode in ("m1", "m4", "m5", "m6"):
         return row["input"]
     if mode == "m2":
         return prompting.build_icl_source(
@@ -227,6 +251,16 @@ def _infer_torch_dtype(device: torch.device, *, want_fp16: bool, want_bf16: bool
     return None
 
 
+def resolved_architecture(base_model: str, architecture: str) -> str:
+    if architecture == "causal_lm":
+        return "causal_lm"
+    if architecture == "seq2seq":
+        return "seq2seq"
+    if architecture == "auto":
+        return "causal_lm" if "gpt2" in base_model.lower() else "seq2seq"
+    raise ValueError(architecture)
+
+
 @torch.inference_mode()
 def batched_generate(model, tokenizer, sources: list[str], device: torch.device, max_in: int, max_new: int):
     enc = tokenizer(
@@ -247,6 +281,35 @@ def batched_generate(model, tokenizer, sources: list[str], device: torch.device,
     return tokenizer.batch_decode(out_ids, skip_special_tokens=True)
 
 
+@torch.inference_mode()
+def batched_generate_causal(
+    model, tokenizer, sources: list[str], device: torch.device, max_in: int, max_new: int
+):
+    enc = tokenizer(
+        sources,
+        truncation=True,
+        max_length=max_in,
+        padding=True,
+        return_tensors="pt",
+    )
+    enc = {k: v.to(device) for k, v in enc.items()}
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    out_ids = model.generate(
+        **enc,
+        max_new_tokens=max_new,
+        pad_token_id=pad_id,
+    )
+    lens = enc["attention_mask"].sum(dim=1).tolist()
+    decoded: list[str] = []
+    for i in range(len(sources)):
+        start = int(lens[i])
+        new_part = out_ids[i, start:]
+        decoded.append(tokenizer.decode(new_part, skip_special_tokens=True).strip())
+    return decoded
+
+
 def run_for_mode(
     mode: str,
     rows: list[dict],
@@ -265,19 +328,44 @@ def run_for_mode(
     ttt_steps: int,
     ttt_lr: float,
     torch_dtype: torch.dtype | None,
+    architecture: str = "seq2seq",
+    m6_mam_checkpoint: str | None = None,
+    m6_inner_window: int = 256,
+    m6_inner_stride: int = 128,
 ) -> list[tuple[str, str]]:
     load_kw: dict = {"cache_dir": cache_dir}
     if torch_dtype is not None:
         load_kw["torch_dtype"] = torch_dtype
-    base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, **load_kw)
-    if mode in ("m3", "m4"):
-        if not adapter_dir:
-            raise ValueError(f"{mode} requires --adapter_dir (global LoRA+RAG checkpoint).")
-        model = PeftModel.from_pretrained(base, adapter_dir)
-    elif mode == "m5":
-        model = modeling_lora.attach_lora(base)
+
+    if architecture == "causal_lm":
+        if mode not in ("m1", "m6"):
+            raise ValueError(
+                f"Causal LM (--architecture causal_lm or a gpt2 base_model) supports m1 and m6 only; got {mode=!r}."
+            )
+        if mode == "m6":
+            from ttt.mam_model import TTTGPT2
+
+            load_plain = {k: v for k, v in load_kw.items() if k != "torch_dtype"}
+            model = TTTGPT2(base_model_name, ttt_fraction=0.25)
+            if m6_mam_checkpoint:
+                try:
+                    sd = torch.load(m6_mam_checkpoint, map_location="cpu", weights_only=False)
+                except TypeError:
+                    sd = torch.load(m6_mam_checkpoint, map_location="cpu")
+                model.load_state_dict(sd, strict=True)
+            model = model.to(device)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kw)
     else:
-        model = base
+        base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, **load_kw)
+        if mode in ("m3", "m4"):
+            if not adapter_dir:
+                raise ValueError(f"{mode} requires --adapter_dir (global LoRA+RAG checkpoint).")
+            model = PeftModel.from_pretrained(base, adapter_dir)
+        elif mode == "m5":
+            model = modeling_lora.attach_lora(base)
+        else:
+            model = base
 
     model.to(device)
     model.eval()
@@ -285,7 +373,11 @@ def run_for_mode(
     preds: list[tuple[str, str]] = []
 
     def handle_batch(sources: list[str], meta_ids: list[str]):
-        decoded = batched_generate(model, tokenizer, sources, device, max_in, max_new)
+        gen_tok = getattr(model, "tokenizer", tokenizer)
+        if architecture == "causal_lm":
+            decoded = batched_generate_causal(model, gen_tok, sources, device, max_in, max_new)
+        else:
+            decoded = batched_generate(model, tokenizer, sources, device, max_in, max_new)
         preds.extend(zip(meta_ids, decoded))
 
     if mode in ("m1", "m2", "m3"):
@@ -309,38 +401,121 @@ def run_for_mode(
             handle_batch(batch_src, batch_ids)
         return preds
 
-    # M4 / M5: snapshot LoRA (global for M4, freshly initialized for M5), never leak across users.
-    snapshot = modeling_lora.lora_state_snapshot(model)
-    for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
-        modeling_lora.restore_lora_snapshot(model, snapshot)
-        prof = merge_profiles(urows)
-        run_ttt_steps(
-            model,
-            tokenizer,
-            task=task,
-            profile=prof,
-            device=device,
-            max_input_length=max_in,
-            micro_batch_size=2,
-            steps=ttt_steps,
-            lr=ttt_lr,
-        )
-        model.eval()
+    if mode in ("m4", "m5"):
+        # Snapshot LoRA (global for M4, freshly initialized for M5), never leak across users.
+        snapshot = modeling_lora.lora_state_snapshot(model)
+        for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
+            modeling_lora.restore_lora_snapshot(model, snapshot)
+            prof = merge_profiles(urows)
+            run_ttt_steps(
+                model,
+                tokenizer,
+                task=task,
+                profile=prof,
+                device=device,
+                max_input_length=max_in,
+                micro_batch_size=2,
+                steps=ttt_steps,
+                lr=ttt_lr,
+            )
+            model.eval()
 
-        batch_src, batch_ids = [], []
-        for row in urows:
-            # TTT uses profile in run_ttt_steps; decode matches M1 (no RAG) to separate TTT vs retrieval.
-            batch_src.append(row["input"])
-            batch_ids.append(row["id"])
-            if len(batch_src) >= batch_size:
+            batch_src, batch_ids = [], []
+            for row in urows:
+                # TTT uses profile in run_ttt_steps; decode matches M1 (no RAG) to separate TTT vs retrieval.
+                batch_src.append(row["input"])
+                batch_ids.append(row["id"])
+                if len(batch_src) >= batch_size:
+                    handle_batch(batch_src, batch_ids)
+                    batch_src, batch_ids = [], []
+            if batch_src:
                 handle_batch(batch_src, batch_ids)
-                batch_src, batch_ids = [], []
-        if batch_src:
-            handle_batch(batch_src, batch_ids)
 
-        modeling_lora.restore_lora_snapshot(model, snapshot)
+            modeling_lora.restore_lora_snapshot(model, snapshot)
 
-    return preds
+        return preds
+
+    if mode == "m6":
+        if architecture == "causal_lm":
+            from ttt import e2e as ttt_e2e
+            from ttt.mam_inner import inner_adapt_inplace
+
+            for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
+                snap = model.snapshot_inner()
+                try:
+                    prof = merge_profiles(urows)
+                    stream = ttt_e2e.build_flat_history_stream(task, prof)
+                    gen_tok = model.tokenizer
+                    enc = gen_tok(
+                        stream,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=min(4096, max_in * 8),
+                    )
+                    ctx_ids = enc["input_ids"].to(device)
+                    if ctx_ids.shape[1] >= 2:
+                        inner_adapt_inplace(
+                            model,
+                            ctx_ids,
+                            steps=max(1, ttt_steps),
+                            lr=ttt_lr,
+                            window=m6_inner_window,
+                            stride=m6_inner_stride,
+                        )
+                    model.eval()
+                    batch_src, batch_ids = [], []
+                    for row in urows:
+                        batch_src.append(row["input"])
+                        batch_ids.append(row["id"])
+                        if len(batch_src) >= batch_size:
+                            handle_batch(batch_src, batch_ids)
+                            batch_src, batch_ids = [], []
+                    if batch_src:
+                        handle_batch(batch_src, batch_ids)
+                finally:
+                    model.restore_inner(snap)
+            return preds
+
+        from ttt import e2e as ttt_e2e
+
+        ffn = ttt_e2e.collect_inner_mlp_params(model, layer_fraction=0.25)
+        if not ffn:
+            raise RuntimeError(
+                "Could not collect inner MLP parameters for m6 (unexpected model structure for this backbone)."
+            )
+        ffn_snap = ttt_e2e.snapshot_selected_params(ffn)
+        for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
+            ttt_e2e.restore_selected_params(ffn, ffn_snap)
+            prof = merge_profiles(urows)
+            ttt_e2e.run_ttt_e2e_simulation(
+                model,
+                tokenizer,
+                task=task,
+                profile=prof,
+                device=device,
+                max_input_length=max_in,
+                micro_batch_size=2,
+                steps=ttt_steps,
+                lr=ttt_lr,
+                layer_fraction=0.25,
+                sliding_window=256,
+                sliding_stride=128,
+                max_sliding_windows=16,
+            )
+            model.eval()
+            batch_src, batch_ids = [], []
+            for row in urows:
+                batch_src.append(row["input"])
+                batch_ids.append(row["id"])
+                if len(batch_src) >= batch_size:
+                    handle_batch(batch_src, batch_ids)
+                    batch_src, batch_ids = [], []
+            if batch_src:
+                handle_batch(batch_src, batch_ids)
+        ttt_e2e.restore_selected_params(ffn, ffn_snap)
+        return preds
+
+    raise ValueError(f"Unsupported mode: {mode!r}")
 
 
 def main():
@@ -375,7 +550,16 @@ def main():
         uid = data_io.infer_user_id(r, user_field=args.user_field)
         user_to_rows[uid].append(r)
 
+    modes = [m.strip().lower() for m in args.modes.split(",") if m.strip()]
+    arch = resolved_architecture(args.base_model, args.architecture)
+    if arch == "causal_lm" and any(m in ("m2", "m3", "m4", "m5") for m in modes):
+        raise ValueError(
+            "Causal LM (gpt2-style) is only wired for m1 and m6; use --architecture seq2seq for m2–m5."
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, cache_dir=args.cache_dir, use_fast=False)
+    if arch == "causal_lm" and tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
     rag_gen, contriever = create_prompt_generator(
         args.num_retrieved,
         args.retriever,
@@ -388,8 +572,6 @@ def main():
 
     def rag_prompt(row: dict) -> str:
         return rag_gen(row["input"], row["profile"], args.task)
-
-    modes = [m.strip().lower() for m in args.modes.split(",") if m.strip()]
 
     results_summary: dict[str, dict] = {}
     for mode in modes:
@@ -412,6 +594,10 @@ def main():
             ttt_steps=args.ttt_steps,
             ttt_lr=args.ttt_lr,
             torch_dtype=torch_dtype,
+            architecture=arch,
+            m6_mam_checkpoint=args.m6_mam_checkpoint,
+            m6_inner_window=args.m6_inner_window,
+            m6_inner_stride=args.m6_inner_stride,
         )
         pred_map = {i: p for i, p in pairs}
         preds_ordered = [pred_map[i] for i in id_order]
