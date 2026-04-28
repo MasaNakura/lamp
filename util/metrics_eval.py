@@ -36,15 +36,20 @@ def make_per_example_string_metric():
     return score_one
 
 
-def write_lamp_predictions(task_underscore: str, pairs: list[tuple[str, str]], out_path: str) -> None:
+def write_lamp_predictions(task_underscore: str, pairs: list[tuple[Any, str]], out_path: str) -> None:
     """
-    Write {"task": "LaMP_5", "golds": [{"id": ..., "output": ...}]} style predictions
-    (same shape as LaMP leaderboard / eval README).
+    Write leaderboard gold-style predictions (LaMP README / ``eval/eval_task.py``):
+
+        {"task": "LaMP_5", "golds": [{"id": ..., "output": ...}, ...]}
+
+    Same schema as official ``*_outputs.json`` gold files; ``id`` types match the
+    values passed in ``pairs`` (typically same as question rows).
     """
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     payload: dict[str, Any] = {
         "task": task_underscore,
         "golds": [{"id": i, "output": o} for i, o in pairs],
     }
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(payload, f, ensure_ascii=False, indent="\t")
+        f.write("\n")

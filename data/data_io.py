@@ -216,6 +216,20 @@ def _unwrap_lamp_records(data: Any, path: str) -> list[dict[str, Any]]:
     )
 
 
+def gold_id_lookup(outputs_path: str) -> dict[str, Any]:
+    """
+    Map ``str(id)`` -> the ``id`` value as stored in the gold ``*_outputs.json`` file.
+
+    LaMP's ``eval/evaluation.py`` compares prediction ids to gold ids with set equality;
+    JSON may use strings vs integers, so predictions should reuse the gold file's ``id``
+    representation when writing leaderboard-format JSON.
+    """
+    with open(outputs_path, encoding="utf-8") as f:
+        o_raw = json.load(f)
+    outputs = _unwrap_lamp_records(o_raw, outputs_path)
+    return {str(o["id"]): o["id"] for o in outputs}
+
+
 def merge_questions_and_outputs(
     questions_path: str, outputs_path: str, *, task: str | None = None
 ) -> list[dict[str, Any]]:

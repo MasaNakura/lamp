@@ -102,7 +102,7 @@ python3 train.py --task LaMP-5 \
 
 ## Evaluate M1–M6
 
-**Required:** `test_questions.json` and `test_outputs.json`. The model is run on question-side fields (`input`, `profile`); predictions are aligned by `id` with gold strings from the outputs file for BLEU, ROUGE, and METEOR (via LaMP `generation_metrics`).
+**Required:** `test_questions.json` and `test_outputs.json`. The model is run on question-side fields (`input`, `profile`); predictions are aligned by `id` with gold strings from the outputs file for BLEU, ROUGE, and METEOR (via LaMP `generation_metrics`). Predictions are also written as **`pred_outputs.json`** in the same schema as the gold outputs file (`task` + `golds` with `id` / `output`, tab-indented). With multiple `--modes` in one run, files are named **`pred_outputs_<mode>.json`** so nothing is overwritten.
 
 For **M4/M5/M6**, test rows are grouped by user (`user_id`-style fields, `--user_field`, or profile fingerprint) for per-user adaptation. **M4/M5** decode with the same string as **M1** (LaMP `input` only); the profile is used only during TTT updates, not as a retrieved prompt at generation time—so you can contrast **M3 (LoRA + RAG at decode)** with **M4/M5 (LoRA adaptation + no retrieval at decode)**. The M4 checkpoint still comes from `train.py` (RAG-supervised); that is a deliberate train/decode asymmetry unless you add a separate non-RAG training stage. **M6** also decodes on **`input` only**; the profile drives inner-loop updates only.
 

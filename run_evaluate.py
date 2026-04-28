@@ -4,7 +4,9 @@ Evaluate personalization baselines on the LaMP **test** split: ``test_questions.
 [LaMP download](https://lamp-benchmark.github.io/download) and ``LaMP/README.md``.
 Rows are aligned by ``id`` (same idea as ``LaMP/LaMP/utils/merge_with_rank.py`` without ranking).
 The model only sees question-side fields; predictions are scored against the outputs file
-(BLEU, ROUGE, METEOR via LaMP metrics).
+(BLEU, ROUGE, METEOR via LaMP metrics). Writes **``pred_outputs.json``** (LaMP gold format:
+``{"task": "LaMP_5"|"LaMP_7", "golds": [{"id", "output"}, ...]}`` with tab-indented JSON;
+multiple ``--modes`` in one run use ``pred_outputs_<mode>.json``).
 
 This script is named ``run_evaluate.py`` (not ``evaluate.py``) so LaMP's metric code can
 ``import evaluate`` and resolve the HuggingFace **evaluate** library instead of this file.
@@ -547,6 +549,7 @@ def main():
     )
     refs = [r["output"] for r in merged]
     id_order = [r["id"] for r in merged]
+    id_for_pred_json = data_io.gold_id_lookup(args.test_outputs_json)
     # Do not pass gold ``output`` into the model forward paths (M1–M5 only use input/profile).
     rows = [{k: v for k, v in r.items() if k != "output"} for r in merged]
     user_to_rows: dict[str, list[dict]] = defaultdict(list)
@@ -607,10 +610,13 @@ def main():
         preds_ordered = [pred_map[i] for i in id_order]
         metrics = metrics_eval.evaluate_strings(preds_ordered, refs)
         results_summary[mode] = metrics
-        out_json = os.path.join(args.output_dir, f"preds_{mode}.json")
+        # LaMP leaderboard format (same as gold ``*_outputs.json``): ``pred_outputs.json``
+        # when a single mode; otherwise one file per mode to avoid clobbering.
+        pred_filename = "pred_outputs.json" if len(modes) == 1 else f"pred_outputs_{mode}.json"
+        out_json = os.path.join(args.output_dir, pred_filename)
         metrics_eval.write_lamp_predictions(
             task_leaderboard_name(args.task),
-            [(i, pred_map[i]) for i in id_order],
+            [(id_for_pred_json.get(str(i), i), pred_map[i]) for i in id_order],
             out_json,
         )
         with open(os.path.join(args.output_dir, f"metrics_{mode}.json"), "w", encoding="utf-8") as f:
