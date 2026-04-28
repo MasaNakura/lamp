@@ -6,7 +6,9 @@ __pycache__/
 venv/
 .env
 lamp-5/*
-exps/
+lamp-7/*
+exps/*
+ckpts/*
 
 # Local experiment outputs (optional)
 checkpoints/
