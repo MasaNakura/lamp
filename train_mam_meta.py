@@ -39,7 +39,6 @@ def parse_args():
     p.add_argument("--output_dir", default="mam_checkpoints")
     p.add_argument("--model_name", default="gpt2", help="HF hub id for GPT-2 (e.g. gpt2, openai-community/gpt2-large).")
     p.add_argument("--meta_steps", type=int, default=2000)
-    p.add_argument("--inner_steps", type=int, default=1)
     p.add_argument("--inner_lr", type=float, default=1e-3)
     p.add_argument("--outer_lr_outer", type=float, default=1e-5)
     p.add_argument("--outer_lr_inner_init", type=float, default=1e-4)
@@ -73,7 +72,6 @@ def main():
         task=args.task,
         device=device,
         meta_steps=args.meta_steps,
-        inner_steps=args.inner_steps,
         inner_lr=args.inner_lr,
         outer_lr_outer=args.outer_lr_outer,
         outer_lr_inner_init=args.outer_lr_inner_init,

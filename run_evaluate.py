@@ -106,7 +106,12 @@ def parse_args():
         action="store_true",
         help="On CUDA: use bfloat16 when supported (often best on Ampere+). Incompatible with --fp16.",
     )
-    p.add_argument("--ttt_steps", type=int, default=30)
+    p.add_argument(
+        "--ttt_steps",
+        type=int,
+        default=30,
+        help="M4/M5: number of TTT minibatches. Causal M6: **unused** for inner TTT (paper-style single pass over profile windows; use ``--m6_inner_window`` / ``--m6_inner_stride``).",
+    )
     p.add_argument("--ttt_lr", type=float, default=1e-4)
     p.add_argument(
         "--m6_mam_checkpoint",
@@ -457,7 +462,6 @@ def run_for_mode(
                         inner_adapt_inplace(
                             model,
                             ctx_ids,
-                            steps=max(1, ttt_steps),
                             lr=ttt_lr,
                             window=m6_inner_window,
                             stride=m6_inner_stride,

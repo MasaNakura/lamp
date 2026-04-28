@@ -26,7 +26,6 @@ def _meta_step(
     ctx: torch.Tensor,
     cont: torch.Tensor,
     *,
-    inner_steps: int,
     window: int,
     clip: float = 1.0,
 ) -> float:
@@ -40,7 +39,7 @@ def _meta_step(
         copy_initial_weights=False,
         track_higher_grads=True,
     ) as (fmodel, diffopt):
-        inner_adapt_functional(fmodel, diffopt, ctx, steps=inner_steps, window=window)
+        inner_adapt_functional(fmodel, diffopt, ctx, window=window)
 
         full = torch.cat([ctx, cont], dim=-1)
         logits = fmodel(full).logits
@@ -64,7 +63,6 @@ def run(
     *,
     device: torch.device | None = None,
     meta_steps: int = 2000,
-    inner_steps: int = 1,
     inner_lr: float = 1e-3,
     outer_lr_outer: float = 1e-5,
     outer_lr_inner_init: float = 1e-4,
@@ -104,9 +102,7 @@ def run(
     pbar = tqdm(range(meta_steps), desc="meta-train (wikitext)")
     for step in pbar:
         ctx, cont = next(stream)
-        loss_v = _meta_step(
-            model, outer_opt, inner_opt, ctx, cont, inner_steps=inner_steps, window=window
-        )
+        loss_v = _meta_step(model, outer_opt, inner_opt, ctx, cont, window=window)
         elapsed = time.time() - t0
         log.writerow([step, loss_v, f"{elapsed:.1f}"])
         log_file.flush()
@@ -126,7 +122,6 @@ def run_lamp(
     task: str,
     device: torch.device | None = None,
     meta_steps: int = 2000,
-    inner_steps: int = 1,
     inner_lr: float = 1e-3,
     outer_lr_outer: float = 1e-5,
     outer_lr_inner_init: float = 1e-4,
@@ -169,9 +164,7 @@ def run_lamp(
     pbar = tqdm(range(meta_steps), desc=f"meta-train (LaMP {task})")
     for step in pbar:
         ctx, cont = next(stream)
-        loss_v = _meta_step(
-            model, outer_opt, inner_opt, ctx, cont, inner_steps=inner_steps, window=window
-        )
+        loss_v = _meta_step(model, outer_opt, inner_opt, ctx, cont, window=window)
         elapsed = time.time() - t0
         log.writerow([step, loss_v, f"{elapsed:.1f}"])
         log_file.flush()
@@ -187,7 +180,6 @@ def run_lamp(
 def main():
     ap = argparse.ArgumentParser(description="TTT-E2E outer loop (WikiText default).")
     ap.add_argument("--meta-steps", type=int, default=2000)
-    ap.add_argument("--inner-steps", type=int, default=1)
     ap.add_argument("--inner-lr", type=float, default=1e-3)
     ap.add_argument("--context-len", type=int, default=256)
     ap.add_argument("--continuation-len", type=int, default=64)
@@ -198,7 +190,6 @@ def main():
     run(
         device=dev,
         meta_steps=args.meta_steps,
-        inner_steps=args.inner_steps,
         inner_lr=args.inner_lr,
         context_len=args.context_len,
         continuation_len=args.continuation_len,

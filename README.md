@@ -33,7 +33,7 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 | **M3** | Run once; use `--output_dir` as `--adapter_dir` | Load adapter; **RAG** prompt at decode. |
 | **M4** | **Same** checkpoint as M3 | TTT on profile, then decode on **task input only** (no RAG); reset LoRA between users. |
 | **M5** | Skip | Fresh LoRA; TTT on profile; decode on **task input only** (no RAG). |
-| **M6** | Skip (no global LoRA) | **TTT-E2E path:** GPT-2 + `TTTGPT2` (DualMLP); inner-loop NTP on profile; optional meta checkpoint from `train_mam_meta.py`. **Alternate:** Flan-T5 + `ttt/e2e.py` if you keep `--architecture seq2seq` (not the full MAM stack). |
+| **M6** | Skip (no global LoRA) | **TTT-E2E path:** GPT-2 + `TTTGPT2` (DualMLP); inner-loop NTP on profile (LaMP-5 papers / LaMP-7 tweets); optional meta checkpoint from `train_mam_meta.py`. **Alternate:** Flan-T5 + `ttt/e2e.py` if you keep `--architecture seq2seq` (not the full MAM stack). |
 
 ## GPU (CUDA)
 
@@ -159,9 +159,11 @@ python3 run_evaluate.py --task LaMP-5 \
 
 `--adapter_dir` is not used for M5.
 
-### M6 — TTT-E2E on LaMP-5 (GPT-2 + MAM stack)
+### M6 — TTT-E2E on LaMP-5 / LaMP-7 (GPT-2 + MAM stack)
 
-This is the **end-to-end TTT** setup merged from [MAM](https://github.com/evanly-gh/MAM): **DualMLP** (inner fast weights + static anchor), **inner loop** = sliding-window next-token CE on the user’s profile text, **optional outer loop** = meta-training on train profiles so the init is good *after* inner adaptation (`higher` in `ttt/mam_outer.py`).
+This is the **end-to-end TTT** setup merged from [MAM](https://github.com/evanly-gh/MAM): **DualMLP** (inner fast weights + static anchor), **test-time inner** = **one** left-to-right pass of sliding-window next-token CE on the user’s **profile-only** text (LaMP-5: titles/abstracts; LaMP-7: past tweets), matching the paper’s single stream over the context (§2.3). **Meta-training outer loop** (`higher` in `ttt/mam_outer.py`) is optional and separate from that single pass.
+
+The benchmark **query** (`input`: instruction + text to personalize) is **never** used in TTT—only at generation—so you are not leaking the test prompt into adaptation. LaMP-7 has no abstract/title pairs; the code uses **tweet-only** streams and **style-style** pseudo-tasks (see `ttt/training.py` / `ttt/e2e.py`) instead of LaMP-5’s title-from-abstract pairs.
 
 **Requirements**
 
@@ -169,7 +171,7 @@ This is the **end-to-end TTT** setup merged from [MAM](https://github.com/evanly
 - Use a **GPT-2** Hub id for `--base_model` (e.g. `gpt2` or `openai-community/gpt2-large`).
 - Pass **`--architecture causal_lm`** (or rely on **`--architecture auto`**, which picks causal LM when the base model name contains `gpt2`).
 
-**Step 1 — (Optional) Meta-train the outer loop on LaMP-5 train JSON**
+**Step 1 — (Optional) Meta-train the outer loop on LaMP-5 or LaMP-7 train JSON**
 
 This teaches the slow weights so held-out continuation NTP is good after inner TTT. Checkpoints and a CSV log are written to `--output_dir`.
 
@@ -183,9 +185,11 @@ python3 train_mam_meta.py --task LaMP-5 \
   --ckpt_every 100
 ```
 
+LaMP-7: use `--task LaMP-7` and your LaMP-7 train JSON paths (same flags). Meta-training uses **shorter** per-row floors for tweet-only profiles (`ttt/mam_data.py`).
+
 For a quick wiring check, use `--meta_steps 20`. Larger `--model_name` (e.g. `openai-community/gpt2-large`) needs more RAM/VRAM.
 
-**Step 2 — Evaluate M6 on LaMP-5 test JSON**
+**Step 2 — Evaluate M6 on LaMP-5 or LaMP-7 test JSON**
 
 Inner adaptation runs **per user** on the merged profile; inner weights are **reset** between users. Pass the meta checkpoint from Step 1 if you ran it; omit `--m6_mam_checkpoint` to run **inner-only** TTT on top of pretrained GPT-2 with the same `TTTGPT2` architecture.
 
@@ -197,16 +201,18 @@ python3 run_evaluate.py --task LaMP-5 \
   --test_questions_json path/to/test_questions.json \
   --test_outputs_json path/to/test_outputs.json \
   --m6_mam_checkpoint path/to/mam_ckpts/latest.pt \
-  --ttt_steps 30 --ttt_lr 1e-4 \
-  --m6_inner_window 256 --m6_inner_stride 128 \
   --output_dir path/to/eval_out/m6_ttt_e2e
 ```
 
-Omit `--m6_mam_checkpoint` if you did not run Step 1. Tune **`--ttt_steps`** / **`--ttt_lr`** / window flags for speed vs adaptation strength.
+LaMP-7 example: set `--task LaMP-7` and LaMP-7 test paths. Tweet histories are often shorter than paper abstracts; try a **smaller** inner window if you want more windows per profile, e.g. `--m6_inner_window 128 --m6_inner_stride 64`.
+
+Omit `--m6_mam_checkpoint` if you did not run Step 1. Tune **`--ttt_lr`** and sliding-window flags for adaptation quality.
+
+**Speed / paper alignment:** TTT-E2E at test time **streams the context once** with mini-batch NTP updates along the way (see §2.3, *Mini-Batch TTT and Sliding Window* in [the paper](https://arxiv.org/abs/2512.23675)); there is **no** second full pass over the same tokens. Here, ``inner_adapt_inplace`` does **one** left-to-right pass over sliding windows (one SGD step per window). Cost per user is **~(#windows)**; widen **`--m6_inner_stride`** or shrink **`--m6_inner_window`** to reduce that. ``--ttt_steps`` does **not** affect causal M6 inner TTT (it remains for M4/M5). The official JAX stack is faster; this path is a minimal PyTorch analogue.
 
 **M6 on Flan-T5 (no MAM stack)**
 
-If you keep the default Flan base and seq2seq stack, **`--modes m6`** uses **`ttt/e2e.py`** (FFN-only inner steps on pseudo-tasks + sliding windows). That path does **not** load `TTTGPT2`; it is a lighter baseline, not the GPT-2 MAM reproduction above.
+If you keep the default Flan base and seq2seq stack, **`--modes m6`** uses **`ttt/e2e.py`** (FFN-only inner steps on pseudo-tasks + sliding windows). That path does **not** load `TTTGPT2`; it is a lighter baseline, not the GPT-2 MAM reproduction above. It supports **LaMP-7** via the same profile pseudo-tasks as `training.py`.
 
 ### All modes (M1–M6)
 
@@ -222,7 +228,7 @@ python3 run_evaluate.py --task LaMP-5 \
 
 `--adapter_dir` is **required** whenever `m3` or `m4` appears in `--modes` (including this all-modes line). It is unused for `m1`, `m2`, `m5`, and **`m6` in seq2seq mode** but may still be passed.
 
-**Note:** You cannot mix **causal** M6 (`gpt2` + `TTTGPT2`) with **Flan** M1–M5 in a single `run_evaluate.py` invocation, because `--base_model` and `--architecture` apply to the whole run. Run **TTT-E2E (GPT-2 M6)** as a separate command using the **M6 — TTT-E2E on LaMP-5** steps above.
+**Note:** You cannot mix **causal** M6 (`gpt2` + `TTTGPT2`) with **Flan** M1–M5 in a single `run_evaluate.py` invocation, because `--base_model` and `--architecture` apply to the whole run. Run **TTT-E2E (GPT-2 M6)** as a separate command using the **M6 — TTT-E2E on LaMP-5 / LaMP-7** steps above.
 
 ## Common `run_evaluate.py` flags
 
@@ -233,9 +239,9 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--num_retrieved`, `--retriever`, `--ranked` | RAG; align with training / LaMP ranking. |
 | `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching; on GPU prefer larger `--batch_size` with `--fp16` or `--bf16`. |
 | `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). **GPT-2 M6 (`TTTGPT2`)** loads in fp32 for stable inner steps. |
-| `--ttt_steps`, `--ttt_lr` | Inner adaptation steps and learning rate (M4/M5 LoRA TTT; **M6** inner loop). |
+| `--ttt_steps`, `--ttt_lr` | M4/M5: TTT minibatch count and LR. **Causal M6:** ``ttt_lr`` only (inner SGD); ``ttt_steps`` ignored for inner TTT (single pass per paper). |
 | `--m6_mam_checkpoint` | **Causal M6 only:** `latest.pt` (or other) from `train_mam_meta.py`. |
-| `--m6_inner_window`, `--m6_inner_stride` | Sliding NTP windows during **causal M6** inner adaptation. |
+| `--m6_inner_window`, `--m6_inner_stride` | Sliding NTP windows during **causal M6** inner adaptation (larger stride ⇒ fewer windows). |
 | `--user_field` | JSON field for user id when grouping test rows (M4/M5/**M6**). |
 | `--cache_dir` | Hugging Face cache directory. |
 | `--verbose`, `--verbose_max_samples` | Print per-example inputs, profile counts, encoder preview, preds vs gold, and per-row BLEU/ROUGE/METEOR (cap rows with `verbose_max_samples`, `-1` = all). |

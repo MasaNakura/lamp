@@ -1,4 +1,4 @@
-"""Meta-training data: WikiText (MAM default) or LaMP-5 profile streams."""
+"""Meta-training data: WikiText (MAM default) or LaMP profile streams (LaMP-5 / LaMP-7)."""
 from __future__ import annotations
 
 import os
@@ -97,22 +97,28 @@ def _lamp_train_token_cache(
         except TypeError:
             return torch.load(cache_path)
 
+    # LaMP-7 rows are short tweets per profile item; use lower floors than LaMP-5 title+abstract.
+    min_doc_chars = 24 if task == "LaMP-7" else 80
+    min_row_tokens = 12 if task == "LaMP-7" else 32
+    min_total_tokens = 256 if task == "LaMP-7" else 512
+
     buf: list[int] = []
     for row in rows:
         prof = row.get("profile") or []
         doc = _lamp_profile_document(task, prof if isinstance(prof, list) else [])
-        if len(doc) < 80:
+        if len(doc) < min_doc_chars:
             continue
         ids = tokenizer.encode(doc)
-        if len(ids) < 32:
+        if len(ids) < min_row_tokens:
             continue
         buf.extend(ids)
         buf.append(tokenizer.eos_token_id)
 
-    if len(buf) < 512:
+    if len(buf) < min_total_tokens:
         raise RuntimeError(
-            "LaMP meta cache: too few tokens after flattening profiles. "
-            "Check that train JSON has real profile text, not placeholders."
+            f"LaMP meta cache: too few tokens after flattening profiles ({len(buf)} < {min_total_tokens}). "
+            "Check that train JSON has real profile text, not placeholders. "
+            "LaMP-7 needs enough tweets across the train split to fill the buffer."
         )
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
     tensor = torch.tensor(buf, dtype=torch.long)
