@@ -239,7 +239,7 @@ def main():
         args=targs,
         train_dataset=train_hf,
         eval_dataset=val_hf,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=collator,
         compute_metrics=compute_metrics if use_eval else None,
     )
