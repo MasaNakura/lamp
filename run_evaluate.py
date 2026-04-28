@@ -413,6 +413,9 @@ def run_for_mode(
         snapshot = modeling_lora.lora_state_snapshot(model)
         for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
             modeling_lora.restore_lora_snapshot(model, snapshot)
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
             prof = merge_profiles(urows)
             run_ttt_steps(
                 model,
