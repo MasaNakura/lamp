@@ -723,7 +723,7 @@ def main():
         tokenizer,
     )
     if contriever is not None:
-        contriever = contriever.to("cpu")
+        contriever = contriever.to(device)
 
     def rag_prompt(row: dict) -> str:
         return rag_gen(row["input"], row["profile"], args.task)
