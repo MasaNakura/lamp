@@ -17,8 +17,8 @@ Models (paper storyboard):
   M3 Global LoRA + RAG (checkpoint from train.py; RAG prompt at decode)
   M4 Global LoRA + TTT (TTT on profile; decode uses **task input only**, no RAG—baseline TTT vs M3 RAG)
   M5 Clean TTT (same decode as M1/M4; fresh LoRA + TTT per user)
-  M6 TTT-E2E: seq2seq path uses ``ttt/e2e.py`` (T5 FFN-only inner). Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``;
-  optional ``--m6_mam_checkpoint`` from ``train_mam_meta.py``). No global LoRA.
+  M6 TTT-E2E: seq2seq uses ``ttt/t5_sliding_ttt.py`` (single-pass sliding FFN inner; shared ``--m6_*`` flags with causal GPT-2 M6).
+  Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m6_mam_checkpoint``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
 """
@@ -85,7 +85,7 @@ def parse_args():
     p.add_argument(
         "--modes",
         default="m1,m2,m3,m4,m5",
-        help="Comma list among m1..m6 (m6 = FFN-only TTT-E2E-style sim from ttt/e2e.py; base model).",
+        help="Comma list among m1..m6 (m6 = TTT-E2E-style inner: Flan ``t5_sliding_ttt`` or GPT-2 ``mam_inner``; base model).",
     )
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_retrieved", type=int, default=3)
@@ -113,7 +113,7 @@ def parse_args():
         "--ttt_steps",
         type=int,
         default=30,
-        help="M4/M5: number of TTT minibatches. Causal M6: **unused** for inner TTT (paper-style single pass over profile windows; use ``--m6_inner_window`` / ``--m6_inner_stride``).",
+        help="M4/M5: number of TTT minibatches. M6 (causal or seq2seq): **unused** for inner TTT (single sliding pass; use ``--m6_inner_window`` / ``--m6_inner_stride``).",
     )
     p.add_argument("--ttt_lr", type=float, default=1e-4)
     p.add_argument(
@@ -121,15 +121,24 @@ def parse_args():
         default=None,
         help="For causal m6 only: optional ``.pt`` state_dict from ``train_mam_meta.py`` (TTTGPT2).",
     )
-    p.add_argument("--m6_inner_window", type=int, default=256, help="Sliding NTP window for causal m6 inner loop (must be ≤ backbone ``n_positions``, e.g. 1024 for GPT-2).")
-    p.add_argument("--m6_inner_stride", type=int, default=128, help="Stride between windows for causal m6 inner loop.")
+    p.add_argument(
+        "--m6_inner_window",
+        type=int,
+        default=256,
+        help="M6 sliding inner: token window size. **Causal (GPT-2):** must be ≤ ``n_positions`` (1024). **Seq2seq (Flan-T5):** ``ttt/t5_sliding_ttt.py`` profile pass.",
+    )
+    p.add_argument(
+        "--m6_inner_stride",
+        type=int,
+        default=128,
+        help="M6 sliding inner: stride between windows (seq2seq Flan path and causal GPT-2 path).",
+    )
     p.add_argument(
         "--m6_profile_max_tokens",
         type=int,
         default=None,
-        help="Causal M6: max tokens when encoding the merged profile stream for inner TTT (tokenizer truncation). "
-        "If unset, uses min(4096, 8 × --max_input_length) for backward compatibility. "
-        "Inner passes still use ``--m6_inner_window``-sized chunks over this long sequence.",
+        help="M6 (causal GPT-2 and seq2seq Flan-T5): max tokens for the merged **profile** stream before sliding inner TTT. "
+        "If unset, uses min(4096, 8 × --max_input_length). Sliding uses ``--m6_inner_window`` / ``--m6_inner_stride``.",
     )
     p.add_argument("--user_field", default=None)
     p.add_argument(
@@ -637,6 +646,7 @@ def run_for_mode(
             return preds
 
         from ttt import e2e as ttt_e2e
+        from ttt.t5_sliding_ttt import inner_adapt_t5_sliding_profile
 
         ffn = ttt_e2e.collect_inner_mlp_params(model, layer_fraction=0.25)
         if not ffn:
@@ -647,20 +657,18 @@ def run_for_mode(
         for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
             ttt_e2e.restore_selected_params(ffn, ffn_snap)
             prof = merge_profiles(urows)
-            ttt_e2e.run_ttt_e2e_simulation(
+            prof_cap = _m6_profile_token_cap(max_in, m6_profile_max_tokens)
+            inner_adapt_t5_sliding_profile(
                 model,
                 tokenizer,
                 task=task,
                 profile=prof,
                 device=device,
-                max_input_length=max_in,
-                micro_batch_size=2,
-                steps=ttt_steps,
                 lr=ttt_lr,
+                window=m6_inner_window,
+                stride=m6_inner_stride,
+                profile_token_cap=prof_cap,
                 layer_fraction=0.25,
-                sliding_window=256,
-                sliding_stride=128,
-                max_sliding_windows=16,
             )
             model.eval()
             batch_src, batch_ids = [], []

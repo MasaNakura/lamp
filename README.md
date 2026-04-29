@@ -21,7 +21,7 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 | `run_evaluate.py` | **M1–M6** inference and metrics (M4/M5 LoRA+TTT; **M6** TTT-E2E-style runs). |
 | `requirements.txt` | Python dependencies (includes **`higher`** for TTT-E2E meta-training). |
 | `data/` | Merge questions/outputs and infer user keys for M4/M5/M6 (`data_io.py`). |
-| `ttt/` | LoRA TTT (`training.py`); Flan **M6** sim (`e2e.py`); GPT-2 **TTT-E2E** (`mam_*.py`, `outer_meta.py`). |
+| `ttt/` | LoRA TTT (`training.py`); Flan **M6** (`t5_sliding_ttt.py` + `e2e.py` helpers); GPT-2 **TTT-E2E** (`mam_*.py`, `outer_meta.py`). |
 | `train_mam_meta.py` | Optional **outer-loop** meta-training of `TTTGPT2` on LaMP train profiles. |
 | `util/` | Add upstream LaMP to `sys.path`, metrics, LoRA, prompts. |
 
@@ -33,7 +33,7 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 | **M3** | Run once; use `--output_dir` as `--adapter_dir` | Load adapter; **RAG** prompt at decode. |
 | **M4** | **Same** checkpoint as M3 | TTT on profile, then decode on **task input only** (no RAG); reset LoRA between users. |
 | **M5** | Skip | Fresh LoRA; TTT on profile; decode on **task input only** (no RAG). |
-| **M6** | Skip (no global LoRA) | **TTT-E2E path:** GPT-2 + `TTTGPT2` (DualMLP); inner-loop NTP on profile (LaMP-5 papers / LaMP-7 tweets); optional meta checkpoint from `train_mam_meta.py`. **Alternate:** Flan-T5 + `ttt/e2e.py` if you keep `--architecture seq2seq` (not the full MAM stack). |
+| **M6** | Skip (no global LoRA) | **TTT-E2E:** GPT-2 + `TTTGPT2` (`--architecture causal_lm`) or Flan-T5 + `t5_sliding_ttt.py` (`seq2seq`); shared `--m6_inner_window`, `--m6_inner_stride`, `--m6_profile_max_tokens`. Optional GPT-2 meta checkpoint from `train_mam_meta.py`. |
 
 ## GPU (CUDA)
 
@@ -163,7 +163,7 @@ python3 run_evaluate.py --task LaMP-5 \
 
 This is the **end-to-end TTT** setup merged from [MAM](https://github.com/evanly-gh/MAM): **DualMLP** (inner fast weights + static anchor), **test-time inner** = **one** left-to-right pass of sliding-window next-token CE on the user’s **profile-only** text (LaMP-5: titles/abstracts; LaMP-7: past tweets), matching the paper’s single stream over the context (§2.3). **Meta-training outer loop** (`higher` in `ttt/mam_outer.py`) is optional and separate from that single pass.
 
-The benchmark **query** (`input`: instruction + text to personalize) is **never** used in TTT—only at generation—so you are not leaking the test prompt into adaptation. LaMP-7 has no abstract/title pairs; the code uses **tweet-only** streams and **style-style** pseudo-tasks (see `ttt/training.py` / `ttt/e2e.py`) instead of LaMP-5’s title-from-abstract pairs.
+The benchmark **query** (`input`: instruction + text to personalize) is **never** used in TTT—only at generation—so you are not leaking the test prompt into adaptation. LaMP-7 uses **tweet-only** profile streams for inner TTT (see `ttt/training.py` for pseudo-task construction used by M4/M5 LoRA TTT).
 
 **Requirements**
 
@@ -208,15 +208,15 @@ LaMP-7 example: set `--task LaMP-7` and LaMP-7 test paths. Tweet histories are o
 
 Omit `--m6_mam_checkpoint` if you did not run Step 1. Tune **`--ttt_lr`** and sliding-window flags for adaptation quality.
 
-**Speed / paper alignment:** TTT-E2E at test time **streams the context once** with mini-batch NTP updates along the way (see §2.3, *Mini-Batch TTT and Sliding Window* in [the paper](https://arxiv.org/abs/2512.23675)); there is **no** second full pass over the same tokens. Here, ``inner_adapt_inplace`` does **one** left-to-right pass over sliding windows (one SGD step per window). Cost per user is **~(#windows)**; widen **`--m6_inner_stride`** or shrink **`--m6_inner_window`** to reduce that. ``--ttt_steps`` does **not** affect causal M6 inner TTT (it remains for M4/M5). The official JAX stack is faster; this path is a minimal PyTorch analogue.
+**Speed / paper alignment:** TTT-E2E at test time **streams the context once** (§2.3, [paper](https://arxiv.org/abs/2512.23675)). **GPT-2 M6:** ``inner_adapt_inplace`` — one SGD step per window. **Flan M6:** ``t5_sliding_ttt`` — same idea on the profile stream. Cost per user is **~(#windows)**; widen **`--m6_inner_stride`** or shrink **`--m6_inner_window`** to reduce that. ``--ttt_steps`` affects **M4/M5** only, not M6 inner loops. The official JAX stack is faster.
 
-**M6 on Flan-T5 (no MAM stack)**
+**M6 on Flan-T5 (paper-style sliding inner)**
 
-If you keep the default Flan base and seq2seq stack, **`--modes m6`** uses **`ttt/e2e.py`** (FFN-only inner steps on pseudo-tasks + sliding windows). That path does **not** load `TTTGPT2`; it is a lighter baseline, not the GPT-2 MAM reproduction above. It supports **LaMP-7** via the same profile pseudo-tasks as `training.py`.
+With **`--base_model google/flan-t5-small`** and **`--architecture seq2seq`** (or **`auto`**), **`--modes m6`** uses **`ttt/t5_sliding_ttt.py`**: **one** left-to-right pass over the (truncated) profile stream, **one SGD step per sliding window** on the last-fraction **encoder+decoder FFN** weights. Same **`--m6_inner_window`**, **`--m6_inner_stride`**, and **`--m6_profile_max_tokens`** as causal GPT-2 M6.
 
 ### All modes (M1–M6)
 
-Flan-T5 line (M6 here is the **seq2seq** `e2e.py` path; omit `m6` if you only run GPT-2 TTT-E2E in a separate command with `--architecture causal_lm`):
+Flan-T5 line (M6 = **`t5_sliding_ttt`**; run GPT-2 M6 in a **separate** command with `--architecture causal_lm`):
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \
@@ -241,8 +241,8 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). **GPT-2 M6 (`TTTGPT2`)** loads in fp32 for stable inner steps. |
 | `--ttt_steps`, `--ttt_lr` | M4/M5: TTT minibatch count and LR. **Causal M6:** ``ttt_lr`` only (inner SGD); ``ttt_steps`` ignored for inner TTT (single pass per paper). |
 | `--m6_mam_checkpoint` | **Causal M6 only:** `latest.pt` (or other) from `train_mam_meta.py`. |
-| `--m6_inner_window`, `--m6_inner_stride` | Sliding NTP windows during **causal M6** inner adaptation (each forward uses at most this many tokens; must be ≤ the backbone’s `n_positions`, e.g. **1024** for GPT-2). Larger stride ⇒ fewer windows. |
-| `--m6_profile_max_tokens` | Causal M6: tokenizer cap on the **merged profile** before inner TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. Set higher (e.g. **8192**) to retain more profile text (more windows / VRAM / time). |
+| `--m6_inner_window`, `--m6_inner_stride` | **M6** sliding inner (Flan-T5 and GPT-2): window size and stride. For **GPT-2**, window must be ≤ `n_positions` (e.g. **1024**). Larger stride ⇒ fewer windows. |
+| `--m6_profile_max_tokens` | **M6 (Flan + GPT-2):** tokenizer cap on the **merged profile** before inner sliding TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. |
 | `--user_field` | JSON field for user id when grouping test rows (M4/M5/**M6**). |
 | `--cache_dir` | Hugging Face cache directory. |
 | `--max_users` | If set to `K` (>0), only rows belonging to the **first K distinct users** (in merged test file order) are evaluated—handy for debugging without the full split. |
