@@ -250,10 +250,11 @@ def _m6_profile_token_cap(max_in: int, m6_profile_max_tokens: int | None) -> int
     return min(4096, max_in * 8)
 
 
-# Causal LMs have no LaMP-specific EOS; inner TTT on profile is plain scholarly text (LaMP-5),
-# so unconstrained ``generate`` often continues into abstract-like prose. Cap new tokens and
-# take the first line so metrics compare to short gold titles / tweets.
-_CAUSAL_TITLE_MAX_NEW = 72
+# LaMP-5 ``input`` already asks for a title, but raw GPT-2 does not learn a reliable ``<EOS>``
+# after titles. We treat the first generated newline as end-of-title (same convention as many
+# completion APIs): ``eos_token_id`` includes ``\\n`` so decoding stops there—no word-level clip.
+# ``max_new_tokens`` is still a safety ceiling if the model never emits ``\\n``.
+_CAUSAL_TITLE_MAX_NEW = 64
 _CAUSAL_TWEET_MAX_NEW = 96
 
 
@@ -265,8 +266,23 @@ def _causal_decode_max_new_tokens(task: str, requested_max_new: int) -> int:
     return requested_max_new
 
 
+def _lamp5_title_eos_token_ids(tokenizer, pad_id: int) -> list[int]:
+    """EOS ids for LaMP-5 title decode: standard EOS/pad plus newline (stop after one line)."""
+    out: list[int] = []
+    for t in (tokenizer.eos_token_id, pad_id):
+        if t is not None:
+            tt = int(t)
+            if tt not in out:
+                out.append(tt)
+    for tid in tokenizer.encode("\n", add_special_tokens=False):
+        tt = int(tid)
+        if tt not in out:
+            out.append(tt)
+    return out
+
+
 def _postprocess_causal_generation(task: str, text: str) -> str:
-    """Map open-ended LM completion to LaMP-style short string (title or tweet)."""
+    """Light cleanup after decode (newline stopping does the heavy lifting for LaMP-5 titles)."""
     s = (text or "").strip()
     if not s:
         return s
@@ -393,6 +409,7 @@ def batched_generate_causal(
     max_in: int,
     max_new: int,
     *,
+    task: str | None = None,
     repetition_penalty: float | None = None,
 ):
     enc = tokenizer(
@@ -409,12 +426,16 @@ def batched_generate_causal(
     gen_kw: dict = {"max_new_tokens": max_new, "pad_token_id": pad_id}
     if repetition_penalty is not None and repetition_penalty > 1.0:
         gen_kw["repetition_penalty"] = repetition_penalty
+    if task == "LaMP-5":
+        gen_kw["eos_token_id"] = _lamp5_title_eos_token_ids(tokenizer, int(pad_id))
     out_ids = model.generate(**enc, **gen_kw)
-    lens = enc["attention_mask"].sum(dim=1).tolist()
+    # HF returns [batch, prompt_padded_len + new_len]. New tokens always start *after* the
+    # padded prompt width (same for every row). Using per-row attention_mask.sum() is wrong
+    # for right-padded batches: it decodes pad ids as garbage and mis-aligns continuations.
+    prompt_w = enc["input_ids"].shape[1]
     decoded: list[str] = []
     for i in range(len(sources)):
-        start = int(lens[i])
-        new_part = out_ids[i, start:]
+        new_part = out_ids[i, prompt_w:]
         decoded.append(tokenizer.decode(new_part, skip_special_tokens=True).strip())
     return decoded
 
@@ -497,7 +518,14 @@ def run_for_mode(
             cap_new = _causal_decode_max_new_tokens(task, max_new)
             rep = 1.15 if task in ("LaMP-5", "LaMP-7") else None
             decoded = batched_generate_causal(
-                model, gen_tok, sources, device, max_in, cap_new, repetition_penalty=rep
+                model,
+                gen_tok,
+                sources,
+                device,
+                max_in,
+                cap_new,
+                task=task,
+                repetition_penalty=rep,
             )
             decoded = [_postprocess_causal_generation(task, d) for d in decoded]
         else:

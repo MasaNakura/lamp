@@ -237,7 +237,7 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--base_model` | Default `google/flan-t5-small`. For **TTT-E2E M6**, use a GPT-2 Hub id (e.g. `gpt2`). |
 | `--architecture` | `auto` (default), `seq2seq`, or `causal_lm`. **Causal** is required for GPT-2 M6 (`auto` selects it when `base_model` contains `gpt2`). |
 | `--num_retrieved`, `--retriever`, `--ranked` | RAG; align with training / LaMP ranking. |
-| `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching; on GPU prefer larger `--batch_size` with `--fp16` or `--bf16`. **Causal LM** (`gpt2`, M1/M6): ``max_new_tokens`` is **capped** for LaMP-5 (**72**) and LaMP-7 (**96**) so the model does not ramble; decoding also keeps **the first line only** as the prediction (paper-title / tweet length). |
+| `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching; on GPU prefer larger `--batch_size` with `--fp16` or `--bf16`. **Causal LM** (`gpt2`, M1/M6): LaMP-5 decode treats **newline as an extra EOS** (stop after one line of title) plus a **``max_new_tokens`` ceiling** (64); LaMP-7 caps at 96 new tokens. Light post-processing only strips echoed ``Title:`` / whitespace. |
 | `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). **GPT-2 M6 (`TTTGPT2`)** loads in fp32 for stable inner steps. |
 | `--ttt_steps`, `--ttt_lr` | M4/M5: TTT minibatch count and LR. **Causal M6:** ``ttt_lr`` only (inner SGD); ``ttt_steps`` ignored for inner TTT (single pass per paper). |
 | `--m6_mam_checkpoint` | **Causal M6 only:** `latest.pt` (or other) from `train_mam_meta.py`. |
