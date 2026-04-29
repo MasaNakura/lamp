@@ -92,6 +92,7 @@ def run_lamp(
     log_path: str = "logs/meta_loss_lamp_flan.csv",
     ckpt_every: int = 200,
     lamp_cache_path: str = ".cache/lamp_train_profiles_flan.pt",
+    log_every: int = 50,
 ):
     dev = device or torch.device("cpu")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -117,8 +118,10 @@ def run_lamp(
 
     log_file = open(log_path, "w", newline="", encoding="utf-8")
     log = csv.writer(log_file)
-    log.writerow(["meta_step", "meta_loss", "elapsed_s"])
+    log.writerow(["meta_step", "meta_loss", "meta_loss_ema", "elapsed_s"])
     t0 = time.time()
+    ema_loss: float | None = None
+    ema_decay = 0.98
 
     pbar = tqdm(range(meta_steps), desc=f"meta-train flan (LaMP {task})")
     for step in pbar:
@@ -134,9 +137,15 @@ def run_lamp(
             max_seq_len=max(window, continuation_len),
         )
         elapsed = time.time() - t0
-        log.writerow([step, loss_v, f"{elapsed:.1f}"])
+        ema_loss = loss_v if ema_loss is None else ema_decay * ema_loss + (1.0 - ema_decay) * loss_v
+        log.writerow([step, loss_v, f"{ema_loss:.6f}", f"{elapsed:.1f}"])
         log_file.flush()
-        pbar.set_postfix(loss=f"{loss_v:.3f}")
+        pbar.set_postfix(loss=f"{loss_v:.3f}", ema=f"{ema_loss:.3f}")
+        if log_every > 0 and ((step + 1) % log_every == 0 or step == 0 or step == meta_steps - 1):
+            print(
+                f"[meta-train flan lamp] step={step + 1}/{meta_steps} "
+                f"loss={loss_v:.4f} ema={ema_loss:.4f} elapsed_s={elapsed:.1f}"
+            )
 
         if (step + 1) % ckpt_every == 0 or step == meta_steps - 1:
             torch.save(model.state_dict(), os.path.join(ckpt_dir, f"ttt_flan_meta_{step + 1}.pt"))

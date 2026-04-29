@@ -46,6 +46,7 @@ def parse_args():
     p.add_argument("--continuation_len", type=int, default=64)
     p.add_argument("--window", type=int, default=256)
     p.add_argument("--ckpt_every", type=int, default=200)
+    p.add_argument("--log_every", type=int, default=50, help="Print loss/EMA every N meta steps (0 disables).")
     p.add_argument(
         "--lamp_cache_path",
         default=None,
@@ -81,6 +82,7 @@ def main():
         ckpt_dir=args.output_dir,
         log_path=log_path,
         ckpt_every=args.ckpt_every,
+        log_every=args.log_every,
         model_name=args.model_name,
         lamp_cache_path=lamp_cache,
     )
