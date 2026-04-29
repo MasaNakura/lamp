@@ -17,11 +17,11 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 
 | Path | Role |
 |------|------|
-| `train.py` | **Global** supervised stage: LoRA + RAG (checkpoint for **M3 and M4**). |
-| `run_evaluate.py` | **M1–M6** inference and metrics (M4/M5 LoRA+TTT; **M6** TTT-E2E-style runs). |
+| `train.py` | Optional supervised LoRA + RAG stage (checkpoint can be reused by **M3**). |
+| `run_evaluate.py` | **M1/M2/M3/M4** inference and metrics. |
 | `requirements.txt` | Python dependencies (includes **`higher`** for TTT-E2E meta-training). |
-| `data/` | Merge questions/outputs and infer user keys for M4/M5/M6 (`data_io.py`). |
-| `ttt/` | LoRA TTT (`training.py`); Flan **M6** (`flan_*.py` + `e2e.py` helpers); GPT-2 **TTT-E2E** (`mam_*.py`, `outer_meta.py`). |
+| `data/` | Merge questions/outputs and infer user keys (`data_io.py`). |
+| `ttt/` | LoRA TTT (`training.py`); Flan **M4** (`flan_*.py` + `e2e.py` helpers); GPT-2 **TTT-E2E** (`mam_*.py`, `outer_meta.py`). |
 | `train_mam_meta.py` | Optional **outer-loop** meta-training of `TTTGPT2` on LaMP train profiles. |
 | `util/` | Add upstream LaMP to `sys.path`, metrics, LoRA, prompts. |
 
@@ -30,10 +30,8 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 | Model | `train.py` (global LoRA + RAG) | `run_evaluate.py` |
 |-------|--------------------------------|----------------|
 | **M1, M2** | Skip | Base model; M2 uses long-context ICL. |
-| **M3** | Run once; use `--output_dir` as `--adapter_dir` | Load adapter; **RAG** prompt at decode. |
-| **M4** | **Same** checkpoint as M3 | TTT on profile, then decode on **task input only** (no RAG); reset LoRA between users. |
-| **M5** | Skip | Fresh LoRA; TTT on profile; decode on **task input only** (no RAG). |
-| **M6** | Skip (no global LoRA) | **TTT-E2E:** GPT-2 + `TTTGPT2` (`--architecture causal_lm`) or Flan-T5 + `TTTFlanT5` (`seq2seq`); shared `--m6_inner_window`, `--m6_inner_stride`, `--m6_profile_max_tokens`. Optional checkpoints from `train_mam_meta.py` (GPT-2) and `train_flan_meta.py` (Flan). |
+| **M3** | Optional; use `--output_dir` as `--adapter_dir` if you train | **RAG** prompt at decode; if `--adapter_dir` is provided, loads the LoRA adapter, otherwise uses base model + RAG. |
+| **M4** | Skip (no global LoRA) | **TTT-E2E:** GPT-2 + `TTTGPT2` (`--architecture causal_lm`) or Flan-T5 + `TTTFlanT5` (`seq2seq`); shared `--m4_inner_window`, `--m4_inner_stride`, `--m4_profile_max_tokens`. Optional checkpoints from `train_mam_meta.py` (GPT-2) and `train_flan_meta.py` (Flan). |
 
 ## GPU (CUDA)
 
@@ -68,11 +66,11 @@ hf download google/flan-t5-small
 
 Use `--base_model <hub_id_or_local_path>` to switch models.
 
-## Train global LoRA + RAG (checkpoint for **M3 and M4**)
+## Train global LoRA + RAG (optional checkpoint for **M3**)
 
 **Required:** `train_questions.json` + `train_outputs.json`. **Optional:** `dev_questions.json` + `dev_outputs.json` for validation each epoch and `load_best_model_at_end`; if you omit dev, training runs without evaluation loops (checkpoints are still saved each epoch).
 
-The `--output_dir` you pass here is the **`--adapter_dir`** for M3/M4 in `run_evaluate.py`. Merged `merged_train.json` (and `merged_dev.json` when dev is set) are written under `--output_dir` for transparency.
+The `--output_dir` you pass here is the optional **`--adapter_dir`** for M3 in `run_evaluate.py`. Merged `merged_train.json` (and `merged_dev.json` when dev is set) are written under `--output_dir` for transparency.
 
 Replace `path/to/...` with real paths (relative paths resolve from your current working directory, usually the repo root).
 
@@ -100,13 +98,13 @@ python3 train.py --task LaMP-5 \
 - `--ranked` if profiles are pre-ranked (LaMP `merge_with_rank.py` workflow).
 - On **CUDA**, add e.g. `--fp16 --batch_size 8` (or `--bf16` on GPUs that support bfloat16) for faster steps than plain fp32.
 
-## Evaluate M1–M6
+## Evaluate M1/M2/M3/M4
 
 **Required:** `test_questions.json` and `test_outputs.json`. The model is run on question-side fields (`input`, `profile`); predictions are aligned by `id` with gold strings from the outputs file for BLEU, ROUGE, and METEOR (via LaMP `generation_metrics`). Predictions are also written as **`pred_outputs.json`** in the same schema as the gold outputs file (`task` + `golds` with `id` / `output`, tab-indented). With multiple `--modes` in one run, files are named **`pred_outputs_<mode>.json`** so nothing is overwritten.
 
-For **M4/M5/M6**, test rows are grouped by user (`user_id`-style fields, `--user_field`, or profile fingerprint) for per-user adaptation. **M4/M5** decode with the same string as **M1** (LaMP `input` only); the profile is used only during TTT updates, not as a retrieved prompt at generation time—so you can contrast **M3 (LoRA + RAG at decode)** with **M4/M5 (LoRA adaptation + no retrieval at decode)**. The M4 checkpoint still comes from `train.py` (RAG-supervised); that is a deliberate train/decode asymmetry unless you add a separate non-RAG training stage. **M6** also decodes on **`input` only**; the profile drives inner-loop updates only.
+For **M4**, test rows are grouped by user (`user_id`-style fields, `--user_field`, or profile fingerprint) for per-user adaptation. M4 decodes on **`input` only**; the profile drives inner-loop updates only.
 
-For **M3** only, use the same `--num_retrieved`, `--retriever`, and `--ranked` (or absence of `--ranked`) as in `train.py`, so retrieval matches how the checkpoint was trained. **M4/M5** do not use RAG at decode (profile is used only inside TTT); those flags still apply if you run **M3** in the same command.
+For **M3**, use the same `--num_retrieved`, `--retriever`, and `--ranked` (or absence of `--ranked`) as in `train.py` if you evaluate with a trained adapter.
 
 In the examples below, replace `path/to/test_questions.json` and `path/to/test_outputs.json` with your benchmark files.
 
@@ -128,42 +126,23 @@ python3 run_evaluate.py --task LaMP-5 \
   --modes m2 --output_dir path/to/eval_out/m2
 ```
 
-### M3 — global LoRA + RAG
+### M3 — RAG (optional LoRA adapter)
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \
   --test_questions_json path/to/test_questions.json \
   --test_outputs_json path/to/test_outputs.json \
-  --modes m3 --adapter_dir path/to/checkpoints/lamp5_global_lora \
+  --modes m3 \
   --output_dir path/to/eval_out/m3
 ```
 
-### M4 — global LoRA + TTT
+To evaluate M3 with finetuning, add `--adapter_dir path/to/checkpoints/lamp5_global_lora`.
 
-```bash
-python3 run_evaluate.py --task LaMP-5 \
-  --test_questions_json path/to/test_questions.json \
-  --test_outputs_json path/to/test_outputs.json \
-  --modes m4 --adapter_dir path/to/checkpoints/lamp5_global_lora \
-  --ttt_steps 30 --ttt_lr 1e-4 --output_dir path/to/eval_out/m4
-```
-
-### M5 — clean TTT
-
-```bash
-python3 run_evaluate.py --task LaMP-5 \
-  --test_questions_json path/to/test_questions.json \
-  --test_outputs_json path/to/test_outputs.json \
-  --modes m5 --ttt_steps 30 --ttt_lr 1e-4 --output_dir path/to/eval_out/m5
-```
-
-`--adapter_dir` is not used for M5.
-
-### M6 — TTT-E2E on LaMP-5 / LaMP-7 (GPT-2 + MAM stack)
+### M4 — TTT-E2E on LaMP-5 / LaMP-7 (GPT-2 + MAM stack)
 
 This is the **end-to-end TTT** setup merged from [MAM](https://github.com/evanly-gh/MAM): **DualMLP** (inner fast weights + static anchor), **test-time inner** = **one** left-to-right pass of sliding-window next-token CE on the user’s **profile-only** text (LaMP-5: titles/abstracts; LaMP-7: past tweets), matching the paper’s single stream over the context (§2.3). **Meta-training outer loop** (`higher` in `ttt/mam_outer.py`) is optional and separate from that single pass.
 
-The benchmark **query** (`input`: instruction + text to personalize) is **never** used in TTT—only at generation—so you are not leaking the test prompt into adaptation. LaMP-7 uses **tweet-only** profile streams for inner TTT (see `ttt/training.py` for pseudo-task construction used by M4/M5 LoRA TTT).
+The benchmark **query** (`input`: instruction + text to personalize) is **never** used in TTT—only at generation—so you are not leaking the test prompt into adaptation. LaMP-7 uses **tweet-only** profile streams for inner TTT.
 
 **Requirements**
 
@@ -201,65 +180,64 @@ python3 train_flan_meta.py --task LaMP-5 \
   --ckpt_every 100
 ```
 
-Use `--task LaMP-7` for tweet profiles. Pass `--m6_flan_checkpoint path/to/flan_meta_ckpts/latest.pt` at evaluation time.
+Use `--task LaMP-7` for tweet profiles. Pass `--m4_checkpoint path/to/flan_meta_ckpts/latest.pt` at evaluation time.
 
-**Step 2 — Evaluate M6 on LaMP-5 or LaMP-7 test JSON**
+**Step 2 — Evaluate M4 on LaMP-5 or LaMP-7 test JSON**
 
-Inner adaptation runs **per user** on the merged profile; inner weights are **reset** between users. Pass the meta checkpoint from Step 1 if you ran it; omit `--m6_mam_checkpoint` to run **inner-only** TTT on top of pretrained GPT-2 with the same `TTTGPT2` architecture.
+Inner adaptation runs **per user** on the merged profile; inner weights are **reset** between users. Pass the meta checkpoint from Step 1 if you ran it; omit `--m4_checkpoint` to run **inner-only** TTT on top of pretrained GPT-2 with the same `TTTGPT2` architecture.
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \
   --base_model gpt2 \
   --architecture causal_lm \
-  --modes m6 \
+  --modes m4 \
   --test_questions_json path/to/test_questions.json \
   --test_outputs_json path/to/test_outputs.json \
-  --m6_mam_checkpoint path/to/mam_ckpts/latest.pt \
-  --output_dir path/to/eval_out/m6_ttt_e2e
+  --m4_checkpoint path/to/mam_ckpts/latest.pt \
+  --output_dir path/to/eval_out/m4_ttt_e2e
 ```
 
-LaMP-7 example: set `--task LaMP-7` and LaMP-7 test paths. Tweet histories are often shorter than paper abstracts; try a **smaller** inner window if you want more windows per profile, e.g. `--m6_inner_window 128 --m6_inner_stride 64`.
+LaMP-7 example: set `--task LaMP-7` and LaMP-7 test paths. Tweet histories are often shorter than paper abstracts; try a **smaller** inner window if you want more windows per profile, e.g. `--m4_inner_window 128 --m4_inner_stride 64`.
 
-Omit `--m6_mam_checkpoint` if you did not run Step 1. Tune **`--ttt_lr`** and sliding-window flags for adaptation quality.
+Omit `--m4_checkpoint` if you did not run Step 1. Tune **`--ttt_lr`** and sliding-window flags for adaptation quality.
 
-**Speed / paper alignment:** TTT-E2E at test time **streams the context once** (§2.3, [paper](https://arxiv.org/abs/2512.23675)). **GPT-2 M6:** ``inner_adapt_inplace`` — one SGD step per window. **Flan M6:** ``inner_adapt_t5_inplace`` — same one-pass idea over the profile stream. Cost per user is **~(#windows)**; widen **`--m6_inner_stride`** or shrink **`--m6_inner_window`** to reduce that. ``--ttt_steps`` affects **M4/M5** only, not M6 inner loops. The official JAX stack is faster.
+**Speed / paper alignment:** TTT-E2E at test time **streams the context once** (§2.3, [paper](https://arxiv.org/abs/2512.23675)). **GPT-2 M4:** ``inner_adapt_inplace`` — one SGD step per window. **Flan M4:** ``inner_adapt_t5_inplace`` — same one-pass idea over the profile stream. Cost per user is **~(#windows)**; widen **`--m4_inner_stride`** or shrink **`--m4_inner_window`** to reduce that. The official JAX stack is faster.
 
-**M6 on Flan-T5 (paper-style sliding inner)**
+**M4 on Flan-T5 (paper-style sliding inner)**
 
-With **`--base_model google/flan-t5-small`** and **`--architecture seq2seq`** (or **`auto`**), **`--modes m6`** uses **`TTTFlanT5`** + **`ttt/flan_inner.py`**: **one** left-to-right pass over the (truncated) profile stream, **one SGD step per sliding window** on the last-fraction **encoder+decoder FFN** trainable branch. Same **`--m6_inner_window`**, **`--m6_inner_stride`**, and **`--m6_profile_max_tokens`** as causal GPT-2 M6.
+With **`--base_model google/flan-t5-small`** and **`--architecture seq2seq`** (or **`auto`**), **`--modes m4`** uses **`TTTFlanT5`** + **`ttt/flan_inner.py`**: **one** left-to-right pass over the (truncated) profile stream, **one SGD step per sliding window** on the last-fraction **encoder+decoder FFN** trainable branch. Same **`--m4_inner_window`**, **`--m4_inner_stride`**, and **`--m4_profile_max_tokens`** as causal GPT-2 M4.
 
-### All modes (M1–M6)
+### All modes (M1/M2/M3/M4)
 
-Flan-T5 line (M6 = **`TTTFlanT5` + `flan_inner`**; run GPT-2 M6 in a **separate** command with `--architecture causal_lm`):
+Flan-T5 line (M4 = **`TTTFlanT5` + `flan_inner`**; run GPT-2 M4 in a **separate** command with `--architecture causal_lm`):
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \
   --test_questions_json path/to/test_questions.json \
   --test_outputs_json path/to/test_outputs.json \
-  --modes m1,m2,m3,m4,m5,m6 --adapter_dir path/to/checkpoints/lamp5_global_lora \
+  --modes m1,m2,m3,m4 \
   --output_dir path/to/eval_out/all
 ```
 
-`--adapter_dir` is **required** whenever `m3` or `m4` appears in `--modes` (including this all-modes line). It is unused for `m1`, `m2`, `m5`, and **`m6` in seq2seq mode** but may still be passed.
+`--adapter_dir` is optional for `m3` and unused for `m1`, `m2`, and **`m4` in seq2seq mode**.
 
-**Note:** You cannot mix **causal** M6 (`gpt2` + `TTTGPT2`) with **Flan** M1–M5 in a single `run_evaluate.py` invocation, because `--base_model` and `--architecture` apply to the whole run. Run **TTT-E2E (GPT-2 M6)** as a separate command using the **M6 — TTT-E2E on LaMP-5 / LaMP-7** steps above.
+**Note:** You cannot mix **causal** M4 (`gpt2` + `TTTGPT2`) with **Flan** M1/M2/M3 in a single `run_evaluate.py` invocation, because `--base_model` and `--architecture` apply to the whole run. Run **TTT-E2E (GPT-2 M4)** as a separate command using the **M4 — TTT-E2E on LaMP-5 / LaMP-7** steps above.
 
 ## Common `run_evaluate.py` flags
 
 | Flag | Purpose |
 |------|---------|
-| `--base_model` | Default `google/flan-t5-small`. M6 supports either Flan-T5 (`seq2seq`) or GPT-2 (`causal_lm`). |
-| `--architecture` | `auto` (default), `seq2seq`, or `causal_lm`. **Causal** is required for GPT-2 M6 (`auto` selects it when `base_model` contains `gpt2`). |
+| `--base_model` | Default `google/flan-t5-small`. M4 supports either Flan-T5 (`seq2seq`) or GPT-2 (`causal_lm`). |
+| `--architecture` | `auto` (default), `seq2seq`, or `causal_lm`. **Causal** is required for GPT-2 M4 (`auto` selects it when `base_model` contains `gpt2`). |
 | `--num_retrieved`, `--retriever`, `--ranked` | RAG; align with training / LaMP ranking. |
-| `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching; on GPU prefer larger `--batch_size` with `--fp16` or `--bf16`. **Causal LM** (`gpt2`, M1/M6): LaMP-5 decode treats **newline as an extra EOS** (stop after one line of title) plus a **``max_new_tokens`` ceiling** (64); LaMP-7 caps at 96 new tokens. Light post-processing only strips echoed ``Title:`` / whitespace. |
-| `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). **GPT-2 M6 (`TTTGPT2`)** loads in fp32 for stable inner steps. |
-| `--ttt_steps`, `--ttt_lr` | M4/M5: TTT minibatch count and LR. **M6 (causal + seq2seq):** ``ttt_lr`` only for inner TTT; ``ttt_steps`` ignored (single sliding pass per paper). |
-| `--m6_mam_checkpoint` | **Causal M6 only:** `latest.pt` (or other) from `train_mam_meta.py`. |
-| `--m6_flan_checkpoint` | **Seq2seq M6 only:** `latest.pt` (or other) from `train_flan_meta.py`. |
-| `--m6_ttt_fraction` | M6 only: fraction of final blocks whose FFNs are adapted (default `0.25`, paper-style choice). |
-| `--m6_inner_window`, `--m6_inner_stride` | **M6** sliding inner (Flan-T5 and GPT-2): window size and stride. For **GPT-2**, window must be ≤ `n_positions` (e.g. **1024**). Larger stride ⇒ fewer windows. |
-| `--m6_profile_max_tokens` | **M6 (Flan + GPT-2):** tokenizer cap on the **merged profile** before inner sliding TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. |
-| `--user_field` | JSON field for user id when grouping test rows (M4/M5/**M6**). |
+| `--max_input_length`, `--max_new_tokens`, `--batch_size` | Generation / batching; on GPU prefer larger `--batch_size` with `--fp16` or `--bf16`. **Causal LM** (`gpt2`, M1/M4): LaMP-5 decode treats **newline as an extra EOS** (stop after one line of title) plus a **``max_new_tokens`` ceiling** (64); LaMP-7 caps at 96 new tokens. Light post-processing only strips echoed ``Title:`` / whitespace. |
+| `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). **GPT-2 M4 (`TTTGPT2`)** loads in fp32 for stable inner steps. |
+| `--ttt_steps`, `--ttt_lr` | **M4 (causal + seq2seq):** ``ttt_lr`` only for inner TTT; ``ttt_steps`` is legacy/unused. |
+| `--m4_checkpoint` | **M4 (causal or seq2seq):** checkpoint path, e.g. `latest.pt` from `train_mam_meta.py` or `train_flan_meta.py` matching your `--architecture` and base model family. |
+| `--m4_ttt_fraction` | M4 only: fraction of final blocks whose FFNs are adapted (default `0.25`, paper-style choice). |
+| `--m4_inner_window`, `--m4_inner_stride` | **M4** sliding inner (Flan-T5 and GPT-2): window size and stride. For **GPT-2**, window must be ≤ `n_positions` (e.g. **1024**). Larger stride ⇒ fewer windows. |
+| `--m4_profile_max_tokens` | **M4 (Flan + GPT-2):** tokenizer cap on the **merged profile** before inner sliding TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. |
+| `--user_field` | JSON field for user id when grouping test rows (**M4**). |
 | `--cache_dir` | Hugging Face cache directory. |
 | `--max_users` | If set to `K` (>0), only rows belonging to the **first K distinct users** (in merged test file order) are evaluated—handy for debugging without the full split. |
 | `--verbose`, `--verbose_max_samples` | Print per-example inputs, profile counts, encoder preview, preds vs gold, and per-row BLEU/ROUGE/METEOR (cap rows with `verbose_max_samples`, `-1` = all). |

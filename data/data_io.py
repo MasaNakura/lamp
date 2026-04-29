@@ -1,4 +1,4 @@
-"""Load LaMP JSON lists and infer user keys for per-user evaluation (e.g. M4/M5 TTT)."""
+"""Load LaMP JSON lists and infer user keys for per-user evaluation."""
 from __future__ import annotations
 
 import hashlib
@@ -304,7 +304,7 @@ def _profile_fingerprint(profile: list[dict[str, Any]]) -> str:
 
 def infer_user_id(row: dict[str, Any], user_field: str | None = None) -> str:
     """
-    Stable user key for grouping test rows (M4/M5: TTT + reset per user).
+    Stable user key for grouping test rows.
 
     Prefer an explicit field (`user_field`, or `user_id` / `user` / `author_id` / `author`).
     Otherwise fingerprint the profile. Official user-based splits already keep users

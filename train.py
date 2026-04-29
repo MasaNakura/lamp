@@ -1,9 +1,8 @@
 """
-Global supervised training: LoRA + LaMP RAG prompts (same stage for **M3 and M4**).
+Global supervised training: LoRA + LaMP RAG prompts (optional checkpoint for **M3**).
 
-The saved checkpoint is used by `run_evaluate.py` for **M3** (inference only) and **M4**
-(inference after per-user test-time training). **M5** skips this script and starts
-from the base model with a fresh LoRA at evaluation time.
+The saved checkpoint can be used by `run_evaluate.py` for **M3** (RAG + adapter).
+M3 can also run without this stage (base model + RAG).
 
 **Training data** follows the LaMP release layout: ``train_questions.json`` (``input`` +
 ``profile`` per ``id``) and ``train_outputs.json`` (gold ``output`` per ``id``), merged

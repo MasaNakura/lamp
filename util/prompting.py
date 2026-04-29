@@ -60,10 +60,12 @@ def build_icl_source(
         raise ValueError(task)
 
     tail = "\n\nNow personalize for this instance:\n" + sample["input"]
-    budget = max_tokens - len(tokenizer(tail)["input_ids"])
+    budget = max_tokens - len(
+        tokenizer(tail, add_special_tokens=False, verbose=False)["input_ids"]
+    )
     text_parts: list[str] = []
     for chunk in reversed(hist_chunks):
-        ids = tokenizer(chunk)["input_ids"]
+        ids = tokenizer(chunk, add_special_tokens=False, verbose=False)["input_ids"]
         if len(ids) > budget:
             chunk = tokenizer.decode(ids[-budget:], skip_special_tokens=True)
             text_parts.append(chunk)

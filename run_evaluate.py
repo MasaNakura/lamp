@@ -14,11 +14,9 @@ This script is named ``run_evaluate.py`` (not ``evaluate.py``) so LaMP's metric 
 Models (paper storyboard):
   M1 Zero-shot base (task input only, no profile)
   M2 ICL (history serialized into the encoder budget)
-  M3 Global LoRA + RAG (checkpoint from train.py; RAG prompt at decode)
-  M4 Global LoRA + TTT (TTT on profile; decode uses **task input only**, no RAG—baseline TTT vs M3 RAG)
-  M5 Clean TTT (same decode as M1/M4; fresh LoRA + TTT per user)
-  M6 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m6_*`` flags with causal GPT-2 M6).
-  Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m6_mam_checkpoint``). No global LoRA.
+  M3 RAG (+ optional LoRA adapter from train.py)
+  M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4).
+  Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m4_checkpoint``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
 """
@@ -52,8 +50,7 @@ if _DATA_DIR not in sys.path:
     sys.path.append(_DATA_DIR)
 import data_io  # noqa: E402
 
-from ttt.training import run_ttt_steps  # noqa: E402
-from util import metrics_eval, modeling_lora, prompting  # noqa: E402
+from util import metrics_eval, prompting  # noqa: E402
 
 
 def parse_args():
@@ -79,13 +76,17 @@ def parse_args():
         choices=["auto", "seq2seq", "causal_lm"],
         default="auto",
         help="auto: use causal LM if base_model id contains 'gpt2'; else seq2seq (T5). "
-        "Causal LM is supported for m1 and m6 only.",
+        "Causal LM is supported for m1 and m4 only.",
     )
-    p.add_argument("--adapter_dir", default=None, help="Checkpoint directory from train.py (M3/M4).")
+    p.add_argument(
+        "--adapter_dir",
+        default=None,
+        help="Optional LoRA adapter checkpoint from train.py for M3. If omitted, M3 runs base-model RAG.",
+    )
     p.add_argument(
         "--modes",
-        default="m1,m2,m3,m4,m5",
-        help="Comma list among m1..m6 (m6 = TTT-E2E-style inner: Flan ``flan_inner`` or GPT-2 ``mam_inner``; base model).",
+        default="m1,m2,m3,m4",
+        help="Comma list among m1,m2,m3,m4 (m4 = TTT-E2E-style inner: Flan ``flan_inner`` or GPT-2 ``mam_inner``; base model).",
     )
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_retrieved", type=int, default=3)
@@ -109,47 +110,36 @@ def parse_args():
         action="store_true",
         help="On CUDA: use bfloat16 when supported (often best on Ampere+). Incompatible with --fp16.",
     )
-    p.add_argument(
-        "--ttt_steps",
-        type=int,
-        default=30,
-        help="M4/M5: number of TTT minibatches. M6 (causal or seq2seq): **unused** for inner TTT (single sliding pass; use ``--m6_inner_window`` / ``--m6_inner_stride``).",
-    )
     p.add_argument("--ttt_lr", type=float, default=1e-4)
     p.add_argument(
-        "--m6_mam_checkpoint",
+        "--m4_checkpoint",
         default=None,
-        help="For causal m6 only: optional ``.pt`` state_dict from ``train_mam_meta.py`` (TTTGPT2).",
+        help="For m4 (causal or seq2seq): optional ``.pt`` state_dict from ``train_mam_meta.py`` or ``train_flan_meta.py``.",
     )
     p.add_argument(
-        "--m6_flan_checkpoint",
-        default=None,
-        help="For seq2seq m6 only: optional ``.pt`` state_dict from ``train_flan_meta.py`` (TTTFlanT5).",
-    )
-    p.add_argument(
-        "--m6_ttt_fraction",
+        "--m4_ttt_fraction",
         type=float,
         default=0.25,
-        help="M6 only: fraction of final blocks whose FFNs are adapted (Dual-FFN trainable branch).",
+        help="M4 only: fraction of final blocks whose FFNs are adapted (Dual-FFN trainable branch).",
     )
     p.add_argument(
-        "--m6_inner_window",
+        "--m4_inner_window",
         type=int,
         default=256,
-        help="M6 sliding inner: token window size. **Causal (GPT-2):** must be ≤ ``n_positions`` (1024). **Seq2seq (Flan-T5):** ``ttt/flan_inner.py`` profile pass.",
+        help="M4 sliding inner: token window size. **Causal (GPT-2):** must be ≤ ``n_positions`` (1024). **Seq2seq (Flan-T5):** ``ttt/flan_inner.py`` profile pass.",
     )
     p.add_argument(
-        "--m6_inner_stride",
+        "--m4_inner_stride",
         type=int,
         default=128,
-        help="M6 sliding inner: stride between windows (seq2seq Flan path and causal GPT-2 path).",
+        help="M4 sliding inner: stride between windows (seq2seq Flan path and causal GPT-2 path).",
     )
     p.add_argument(
-        "--m6_profile_max_tokens",
+        "--m4_profile_max_tokens",
         type=int,
         default=None,
-        help="M6 (causal GPT-2 and seq2seq Flan-T5): max tokens for the merged **profile** stream before sliding inner TTT. "
-        "If unset, uses min(4096, 8 × --max_input_length). Sliding uses ``--m6_inner_window`` / ``--m6_inner_stride``.",
+        help="M4 (causal GPT-2 and seq2seq Flan-T5): max tokens for the merged **profile** stream before sliding inner TTT. "
+        "If unset, uses min(4096, 8 × --max_input_length). Sliding uses ``--m4_inner_window`` / ``--m4_inner_stride``.",
     )
     p.add_argument("--user_field", default=None)
     p.add_argument(
@@ -196,7 +186,7 @@ def _encoder_source_for_mode(
     rag_prompt: Callable[[dict], str],
 ) -> str:
     """Same text the model sees (pre-tokenization) as in ``run_for_mode``."""
-    if mode in ("m1", "m4", "m5", "m6"):
+    if mode in ("m1", "m4"):
         return row["input"]
     if mode == "m2":
         return prompting.build_icl_source(
@@ -263,10 +253,10 @@ def _verbose_report_mode(
         print(f"\n[verbose] ... omitted {n - limit} further examples (see --verbose_max_samples).\n")
 
 
-def _m6_profile_token_cap(max_in: int, m6_profile_max_tokens: int | None) -> int:
+def _m4_profile_token_cap(max_in: int, m4_profile_max_tokens: int | None) -> int:
     """Upper bound on profile stream length (tokens) before sliding-window inner TTT."""
-    if m6_profile_max_tokens is not None:
-        return max(1, m6_profile_max_tokens)
+    if m4_profile_max_tokens is not None:
+        return max(1, m4_profile_max_tokens)
     return min(4096, max_in * 8)
 
 
@@ -480,72 +470,66 @@ def run_for_mode(
     max_in: int,
     max_new: int,
     batch_size: int,
-    ttt_steps: int,
     ttt_lr: float,
     torch_dtype: torch.dtype | None,
     architecture: str = "seq2seq",
-    m6_mam_checkpoint: str | None = None,
-    m6_flan_checkpoint: str | None = None,
-    m6_ttt_fraction: float = 0.25,
-    m6_inner_window: int = 256,
-    m6_inner_stride: int = 128,
-    m6_profile_max_tokens: int | None = None,
+    m4_checkpoint: str | None = None,
+    m4_ttt_fraction: float = 0.25,
+    m4_inner_window: int = 256,
+    m4_inner_stride: int = 128,
+    m4_profile_max_tokens: int | None = None,
 ) -> list[tuple[str, str]]:
     load_kw: dict = {"cache_dir": cache_dir}
     if torch_dtype is not None:
         load_kw["torch_dtype"] = torch_dtype
 
     if architecture == "causal_lm":
-        if mode not in ("m1", "m6"):
+        if mode not in ("m1", "m4"):
             raise ValueError(
-                f"Causal LM (--architecture causal_lm or a gpt2 base_model) supports m1 and m6 only; got {mode=!r}."
+                f"Causal LM (--architecture causal_lm or a gpt2 base_model) supports m1 and m4 only; got {mode=!r}."
             )
-        if mode == "m6":
+        if mode == "m4":
             from ttt.mam_model import TTTGPT2
 
             model = TTTGPT2(base_model_name, ttt_fraction=0.25)
-            if m6_mam_checkpoint:
+            if m4_checkpoint:
                 try:
-                    sd = torch.load(m6_mam_checkpoint, map_location="cpu", weights_only=False)
+                    sd = torch.load(m4_checkpoint, map_location="cpu", weights_only=False)
                 except TypeError:
-                    sd = torch.load(m6_mam_checkpoint, map_location="cpu")
+                    sd = torch.load(m4_checkpoint, map_location="cpu")
                 model.load_state_dict(sd, strict=True)
             model = model.to(device)
             max_pos = int(
                 getattr(model.lm.config, "n_positions", None)
                 or getattr(model.lm.config, "max_position_embeddings", 1024)
             )
-            if m6_inner_window > max_pos:
+            if m4_inner_window > max_pos:
                 raise ValueError(
-                    f"--m6_inner_window ({m6_inner_window}) exceeds model max positions ({max_pos}); "
+                    f"--m4_inner_window ({m4_inner_window}) exceeds model max positions ({max_pos}); "
                     f"GPT-2-style LMs are trained with that context cap per forward."
                 )
         else:
             model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kw)
     else:
-        if mode == "m6":
+        if mode == "m4":
             from ttt.flan_dual_mlp_model import TTTFlanT5
 
             model = TTTFlanT5(
                 model_name=base_model_name,
-                ttt_fraction=m6_ttt_fraction,
+                ttt_fraction=m4_ttt_fraction,
                 cache_dir=cache_dir,
                 torch_dtype=torch_dtype,
             )
-            if m6_flan_checkpoint:
+            if m4_checkpoint:
                 try:
-                    sd = torch.load(m6_flan_checkpoint, map_location="cpu", weights_only=False)
+                    sd = torch.load(m4_checkpoint, map_location="cpu", weights_only=False)
                 except TypeError:
-                    sd = torch.load(m6_flan_checkpoint, map_location="cpu")
+                    sd = torch.load(m4_checkpoint, map_location="cpu")
                 model.load_state_dict(sd, strict=True)
         else:
             base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, **load_kw)
-            if mode in ("m3", "m4"):
-                if not adapter_dir:
-                    raise ValueError(f"{mode} requires --adapter_dir (global LoRA+RAG checkpoint).")
+            if mode == "m3" and adapter_dir:
                 model = PeftModel.from_pretrained(base, adapter_dir)
-            elif mode == "m5":
-                model = modeling_lora.attach_lora(base)
             else:
                 model = base
 
@@ -595,44 +579,7 @@ def run_for_mode(
             handle_batch(batch_src, batch_ids)
         return preds
 
-    if mode in ("m4", "m5"):
-        # Snapshot LoRA (global for M4, freshly initialized for M5), never leak across users.
-        snapshot = modeling_lora.lora_state_snapshot(model)
-        for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
-            modeling_lora.restore_lora_snapshot(model, snapshot)
-            for name, param in model.named_parameters():
-                if "lora_" in name:
-                    param.requires_grad = True
-            prof = merge_profiles(urows)
-            run_ttt_steps(
-                model,
-                tokenizer,
-                task=task,
-                profile=prof,
-                device=device,
-                max_input_length=max_in,
-                micro_batch_size=2,
-                steps=ttt_steps,
-                lr=ttt_lr,
-            )
-            model.eval()
-
-            batch_src, batch_ids = [], []
-            for row in urows:
-                # TTT uses profile in run_ttt_steps; decode matches M1 (no RAG) to separate TTT vs retrieval.
-                batch_src.append(row["input"])
-                batch_ids.append(row["id"])
-                if len(batch_src) >= batch_size:
-                    handle_batch(batch_src, batch_ids)
-                    batch_src, batch_ids = [], []
-            if batch_src:
-                handle_batch(batch_src, batch_ids)
-
-            modeling_lora.restore_lora_snapshot(model, snapshot)
-
-        return preds
-
-    if mode == "m6":
+    if mode == "m4":
         if architecture == "causal_lm":
             from ttt import e2e as ttt_e2e
             from ttt.mam_inner import inner_adapt_inplace
@@ -643,7 +590,7 @@ def run_for_mode(
                     prof = merge_profiles(urows)
                     stream = ttt_e2e.build_flat_history_stream(task, prof)
                     gen_tok = model.tokenizer
-                    prof_cap = _m6_profile_token_cap(max_in, m6_profile_max_tokens)
+                    prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
                     enc = gen_tok(
                         stream,
                         return_tensors="pt",
@@ -656,8 +603,8 @@ def run_for_mode(
                             model,
                             ctx_ids,
                             lr=ttt_lr,
-                            window=m6_inner_window,
-                            stride=m6_inner_stride,
+                            window=m4_inner_window,
+                            stride=m4_inner_stride,
                         )
                     model.eval()
                     batch_src, batch_ids = [], []
@@ -678,7 +625,7 @@ def run_for_mode(
         for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
             snap = model.snapshot_inner()
             prof = merge_profiles(urows)
-            prof_cap = _m6_profile_token_cap(max_in, m6_profile_max_tokens)
+            prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
             try:
                 inner_adapt_t5_inplace(
                     model,
@@ -687,8 +634,8 @@ def run_for_mode(
                     profile=prof,
                     device=device,
                     lr=ttt_lr,
-                    window=m6_inner_window,
-                    stride=m6_inner_stride,
+                    window=m4_inner_window,
+                    stride=m4_inner_stride,
                     profile_token_cap=prof_cap,
                 )
                 model.eval()
@@ -734,7 +681,7 @@ def main():
     refs = [r["output"] for r in merged]
     id_order = [r["id"] for r in merged]
     id_for_pred_json = data_io.gold_id_lookup(args.test_outputs_json)
-    # Do not pass gold ``output`` into the model forward paths (M1–M5 only use input/profile).
+    # Do not pass gold ``output`` into the model forward paths.
     rows = [{k: v for k, v in r.items() if k != "output"} for r in merged]
     user_to_rows: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
@@ -756,9 +703,9 @@ def main():
 
     modes = [m.strip().lower() for m in args.modes.split(",") if m.strip()]
     arch = resolved_architecture(args.base_model, args.architecture)
-    if arch == "causal_lm" and any(m in ("m2", "m3", "m4", "m5") for m in modes):
+    if arch == "causal_lm" and any(m in ("m2", "m3") for m in modes):
         raise ValueError(
-            "Causal LM (gpt2-style) is only wired for m1 and m6; use --architecture seq2seq for m2–m5."
+            "Causal LM (gpt2-style) is only wired for m1 and m4; use --architecture seq2seq for m2/m3."
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, cache_dir=args.cache_dir, use_fast=False)
@@ -779,8 +726,6 @@ def main():
 
     results_summary: dict[str, dict] = {}
     for mode in modes:
-        if mode in ("m3", "m4") and not args.adapter_dir:
-            raise ValueError(f"Mode {mode} requires --adapter_dir")
         pairs = run_for_mode(
             mode,
             rows,
@@ -795,16 +740,14 @@ def main():
             max_in=args.max_input_length,
             max_new=args.max_new_tokens,
             batch_size=args.batch_size,
-            ttt_steps=args.ttt_steps,
             ttt_lr=args.ttt_lr,
             torch_dtype=torch_dtype,
             architecture=arch,
-            m6_mam_checkpoint=args.m6_mam_checkpoint,
-            m6_flan_checkpoint=args.m6_flan_checkpoint,
-            m6_ttt_fraction=args.m6_ttt_fraction,
-            m6_inner_window=args.m6_inner_window,
-            m6_inner_stride=args.m6_inner_stride,
-            m6_profile_max_tokens=args.m6_profile_max_tokens,
+            m4_checkpoint=args.m4_checkpoint,
+            m4_ttt_fraction=args.m4_ttt_fraction,
+            m4_inner_window=args.m4_inner_window,
+            m4_inner_stride=args.m4_inner_stride,
+            m4_profile_max_tokens=args.m4_profile_max_tokens,
         )
         pred_map = {i: p for i, p in pairs}
         preds_ordered = [pred_map[i] for i in id_order]

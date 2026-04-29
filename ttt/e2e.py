@@ -166,7 +166,12 @@ def iter_history_token_windows(
     window: int,
     stride: int,
 ) -> Iterator[list[int]]:
-    ids = tokenizer(stream, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    ids = tokenizer(
+        stream,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        verbose=False,
+    )["input_ids"]
     if not ids:
         return
     if stride <= 0:
