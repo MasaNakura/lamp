@@ -17,7 +17,7 @@ Models (paper storyboard):
   M3 Global LoRA + RAG (checkpoint from train.py; RAG prompt at decode)
   M4 Global LoRA + TTT (TTT on profile; decode uses **task input only**, no RAG—baseline TTT vs M3 RAG)
   M5 Clean TTT (same decode as M1/M4; fresh LoRA + TTT per user)
-  M6 TTT-E2E: seq2seq uses ``ttt/t5_sliding_ttt.py`` (single-pass sliding FFN inner; shared ``--m6_*`` flags with causal GPT-2 M6).
+  M6 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m6_*`` flags with causal GPT-2 M6).
   Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m6_mam_checkpoint``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
@@ -85,7 +85,7 @@ def parse_args():
     p.add_argument(
         "--modes",
         default="m1,m2,m3,m4,m5",
-        help="Comma list among m1..m6 (m6 = TTT-E2E-style inner: Flan ``t5_sliding_ttt`` or GPT-2 ``mam_inner``; base model).",
+        help="Comma list among m1..m6 (m6 = TTT-E2E-style inner: Flan ``flan_inner`` or GPT-2 ``mam_inner``; base model).",
     )
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_retrieved", type=int, default=3)
@@ -122,10 +122,21 @@ def parse_args():
         help="For causal m6 only: optional ``.pt`` state_dict from ``train_mam_meta.py`` (TTTGPT2).",
     )
     p.add_argument(
+        "--m6_flan_checkpoint",
+        default=None,
+        help="For seq2seq m6 only: optional ``.pt`` state_dict from ``train_flan_meta.py`` (TTTFlanT5).",
+    )
+    p.add_argument(
+        "--m6_ttt_fraction",
+        type=float,
+        default=0.25,
+        help="M6 only: fraction of final blocks whose FFNs are adapted (Dual-FFN trainable branch).",
+    )
+    p.add_argument(
         "--m6_inner_window",
         type=int,
         default=256,
-        help="M6 sliding inner: token window size. **Causal (GPT-2):** must be ≤ ``n_positions`` (1024). **Seq2seq (Flan-T5):** ``ttt/t5_sliding_ttt.py`` profile pass.",
+        help="M6 sliding inner: token window size. **Causal (GPT-2):** must be ≤ ``n_positions`` (1024). **Seq2seq (Flan-T5):** ``ttt/flan_inner.py`` profile pass.",
     )
     p.add_argument(
         "--m6_inner_stride",
@@ -474,6 +485,8 @@ def run_for_mode(
     torch_dtype: torch.dtype | None,
     architecture: str = "seq2seq",
     m6_mam_checkpoint: str | None = None,
+    m6_flan_checkpoint: str | None = None,
+    m6_ttt_fraction: float = 0.25,
     m6_inner_window: int = 256,
     m6_inner_stride: int = 128,
     m6_profile_max_tokens: int | None = None,
@@ -490,7 +503,6 @@ def run_for_mode(
         if mode == "m6":
             from ttt.mam_model import TTTGPT2
 
-            load_plain = {k: v for k, v in load_kw.items() if k != "torch_dtype"}
             model = TTTGPT2(base_model_name, ttt_fraction=0.25)
             if m6_mam_checkpoint:
                 try:
@@ -511,15 +523,31 @@ def run_for_mode(
         else:
             model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kw)
     else:
-        base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, **load_kw)
-        if mode in ("m3", "m4"):
-            if not adapter_dir:
-                raise ValueError(f"{mode} requires --adapter_dir (global LoRA+RAG checkpoint).")
-            model = PeftModel.from_pretrained(base, adapter_dir)
-        elif mode == "m5":
-            model = modeling_lora.attach_lora(base)
+        if mode == "m6":
+            from ttt.flan_dual_mlp_model import TTTFlanT5
+
+            model = TTTFlanT5(
+                model_name=base_model_name,
+                ttt_fraction=m6_ttt_fraction,
+                cache_dir=cache_dir,
+                torch_dtype=torch_dtype,
+            )
+            if m6_flan_checkpoint:
+                try:
+                    sd = torch.load(m6_flan_checkpoint, map_location="cpu", weights_only=False)
+                except TypeError:
+                    sd = torch.load(m6_flan_checkpoint, map_location="cpu")
+                model.load_state_dict(sd, strict=True)
         else:
-            model = base
+            base = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, **load_kw)
+            if mode in ("m3", "m4"):
+                if not adapter_dir:
+                    raise ValueError(f"{mode} requires --adapter_dir (global LoRA+RAG checkpoint).")
+                model = PeftModel.from_pretrained(base, adapter_dir)
+            elif mode == "m5":
+                model = modeling_lora.attach_lora(base)
+            else:
+                model = base
 
     model.to(device)
     model.eval()
@@ -543,7 +571,7 @@ def run_for_mode(
             )
             decoded = [_postprocess_causal_generation(task, d) for d in decoded]
         else:
-            decoded = batched_generate(model, tokenizer, sources, device, max_in, max_new)
+            decoded = batched_generate(model, gen_tok, sources, device, max_in, max_new)
         preds.extend(zip(meta_ids, decoded))
 
     if mode in ("m1", "m2", "m3"):
@@ -645,42 +673,36 @@ def run_for_mode(
                     model.restore_inner(snap)
             return preds
 
-        from ttt import e2e as ttt_e2e
-        from ttt.t5_sliding_ttt import inner_adapt_t5_sliding_profile
+        from ttt.flan_inner import inner_adapt_t5_inplace
 
-        ffn = ttt_e2e.collect_inner_mlp_params(model, layer_fraction=0.25)
-        if not ffn:
-            raise RuntimeError(
-                "Could not collect inner MLP parameters for m6 (unexpected model structure for this backbone)."
-            )
-        ffn_snap = ttt_e2e.snapshot_selected_params(ffn)
         for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
-            ttt_e2e.restore_selected_params(ffn, ffn_snap)
+            snap = model.snapshot_inner()
             prof = merge_profiles(urows)
             prof_cap = _m6_profile_token_cap(max_in, m6_profile_max_tokens)
-            inner_adapt_t5_sliding_profile(
-                model,
-                tokenizer,
-                task=task,
-                profile=prof,
-                device=device,
-                lr=ttt_lr,
-                window=m6_inner_window,
-                stride=m6_inner_stride,
-                profile_token_cap=prof_cap,
-                layer_fraction=0.25,
-            )
-            model.eval()
-            batch_src, batch_ids = [], []
-            for row in urows:
-                batch_src.append(row["input"])
-                batch_ids.append(row["id"])
-                if len(batch_src) >= batch_size:
+            try:
+                inner_adapt_t5_inplace(
+                    model,
+                    model.tokenizer,
+                    task=task,
+                    profile=prof,
+                    device=device,
+                    lr=ttt_lr,
+                    window=m6_inner_window,
+                    stride=m6_inner_stride,
+                    profile_token_cap=prof_cap,
+                )
+                model.eval()
+                batch_src, batch_ids = [], []
+                for row in urows:
+                    batch_src.append(row["input"])
+                    batch_ids.append(row["id"])
+                    if len(batch_src) >= batch_size:
+                        handle_batch(batch_src, batch_ids)
+                        batch_src, batch_ids = [], []
+                if batch_src:
                     handle_batch(batch_src, batch_ids)
-                    batch_src, batch_ids = [], []
-            if batch_src:
-                handle_batch(batch_src, batch_ids)
-        ttt_e2e.restore_selected_params(ffn, ffn_snap)
+            finally:
+                model.restore_inner(snap)
         return preds
 
     raise ValueError(f"Unsupported mode: {mode!r}")
@@ -778,6 +800,8 @@ def main():
             torch_dtype=torch_dtype,
             architecture=arch,
             m6_mam_checkpoint=args.m6_mam_checkpoint,
+            m6_flan_checkpoint=args.m6_flan_checkpoint,
+            m6_ttt_fraction=args.m6_ttt_fraction,
             m6_inner_window=args.m6_inner_window,
             m6_inner_stride=args.m6_inner_stride,
             m6_profile_max_tokens=args.m6_profile_max_tokens,

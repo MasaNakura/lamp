@@ -4,12 +4,12 @@ TTT-E2E-style **simulation** for LaMP (Sun et al., *End-to-End Test-Time Trainin
 
 The official implementation is JAX in `test-time-training/e2e` on GitHub; this module is a **PyTorch +
 HuggingFace** helper library: **FFN subset collection**, **profile stream text**, **sliding token windows**,
-and **GPT-2 NTP loss** (for ``ttt/outer_meta.py``). **Flan-T5** sliding inner TTT lives in ``ttt/t5_sliding_ttt.py``.
+and **GPT-2 NTP loss** (for ``ttt/outer_meta.py``). **Flan-T5** sliding inner TTT lives in ``ttt/flan_inner.py``.
 
 **Backbones**
 
 * **Causal LM (GPT-2):** ``ttt/mam_inner.py`` + ``ttt/mam_model.py`` (DualMLP); ``outer_meta`` uses ``_causal_lm_loss_on_ids`` here.
-* **Seq2seq (Flan-T5):** ``ttt/t5_sliding_ttt.py`` (single-pass sliding FFN inner from ``run_evaluate.py`` M6).
+* **Seq2seq (Flan-T5):** ``ttt/flan_inner.py`` (single-pass sliding FFN inner from ``run_evaluate.py`` M6).
 
 **Bilevel (paper):** meta-learning at *training* time optimizes the initialization so that post-inner NTP
 loss is low; see ``ttt/outer_meta.py`` for a differentiable **K=1 inner-step** surrogate on GPT-2. **Eval**
