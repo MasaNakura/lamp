@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from typing import Callable
@@ -131,6 +132,14 @@ def parse_args():
         "Inner passes still use ``--m6_inner_window``-sized chunks over this long sequence.",
     )
     p.add_argument("--user_field", default=None)
+    p.add_argument(
+        "--max_users",
+        type=int,
+        default=None,
+        help="If set (>0), only evaluate rows whose user is among the first K distinct users "
+        "(order = first appearance in the merged test file). All rows for those users are kept. "
+        "Useful for quick debugging without scanning the full split.",
+    )
     p.add_argument("--output_dir", default="eval_outputs")
     p.add_argument(
         "--verbose",
@@ -241,6 +250,78 @@ def _m6_profile_token_cap(max_in: int, m6_profile_max_tokens: int | None) -> int
     return min(4096, max_in * 8)
 
 
+# Causal LMs have no LaMP-specific EOS; inner TTT on profile is plain scholarly text (LaMP-5),
+# so unconstrained ``generate`` often continues into abstract-like prose. Cap new tokens and
+# take the first line so metrics compare to short gold titles / tweets.
+_CAUSAL_TITLE_MAX_NEW = 72
+_CAUSAL_TWEET_MAX_NEW = 96
+
+
+def _causal_decode_max_new_tokens(task: str, requested_max_new: int) -> int:
+    if task == "LaMP-5":
+        return max(8, min(requested_max_new, _CAUSAL_TITLE_MAX_NEW))
+    if task == "LaMP-7":
+        return max(8, min(requested_max_new, _CAUSAL_TWEET_MAX_NEW))
+    return requested_max_new
+
+
+def _postprocess_causal_generation(task: str, text: str) -> str:
+    """Map open-ended LM completion to LaMP-style short string (title or tweet)."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    first = s.split("\n")[0].strip()
+    if task == "LaMP-5":
+        first = re.sub(r"^(Title|TITLE)\s*:\s*", "", first).strip()
+        first = re.sub(r"\s+", " ", first).strip()
+    elif task == "LaMP-7":
+        first = re.sub(r"^(Tweet|TWEET)\s*:\s*", "", first).strip()
+        first = re.sub(r"\s+", " ", first).strip()
+    return first
+
+
+def _restrict_to_first_k_users(
+    merged: list[dict[str, object]],
+    rows: list[dict[str, object]],
+    refs: list[str],
+    id_order: list[object],
+    user_field: str | None,
+    k: int,
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[str],
+    list[object],
+    dict[str, list[dict[str, object]]],
+]:
+    """
+    Keep every test row whose ``infer_user_id`` is one of the first ``k`` distinct user ids
+    encountered when scanning ``rows`` in order (then rebuild ``user_to_rows``).
+    """
+    uid_order: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        uid = data_io.infer_user_id(r, user_field=user_field)
+        if uid not in seen:
+            seen.add(uid)
+            uid_order.append(uid)
+            if len(uid_order) >= k:
+                break
+    keep = set(uid_order)
+    idx_kept = [
+        i for i, r in enumerate(rows) if data_io.infer_user_id(r, user_field=user_field) in keep
+    ]
+    merged_f = [merged[i] for i in idx_kept]
+    rows_f = [rows[i] for i in idx_kept]
+    refs_f = [refs[i] for i in idx_kept]
+    id_order_f = [id_order[i] for i in idx_kept]
+    user_to_rows: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for r in rows_f:
+        uid = data_io.infer_user_id(r, user_field=user_field)
+        user_to_rows[uid].append(r)
+    return merged_f, rows_f, refs_f, id_order_f, dict(user_to_rows)
+
+
 def merge_profiles(rows: list[dict]) -> list[dict]:
     seen: set[str] = set()
     merged: list[dict] = []
@@ -305,7 +386,14 @@ def batched_generate(model, tokenizer, sources: list[str], device: torch.device,
 
 @torch.inference_mode()
 def batched_generate_causal(
-    model, tokenizer, sources: list[str], device: torch.device, max_in: int, max_new: int
+    model,
+    tokenizer,
+    sources: list[str],
+    device: torch.device,
+    max_in: int,
+    max_new: int,
+    *,
+    repetition_penalty: float | None = None,
 ):
     enc = tokenizer(
         sources,
@@ -318,11 +406,10 @@ def batched_generate_causal(
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
-    out_ids = model.generate(
-        **enc,
-        max_new_tokens=max_new,
-        pad_token_id=pad_id,
-    )
+    gen_kw: dict = {"max_new_tokens": max_new, "pad_token_id": pad_id}
+    if repetition_penalty is not None and repetition_penalty > 1.0:
+        gen_kw["repetition_penalty"] = repetition_penalty
+    out_ids = model.generate(**enc, **gen_kw)
     lens = enc["attention_mask"].sum(dim=1).tolist()
     decoded: list[str] = []
     for i in range(len(sources)):
@@ -407,7 +494,12 @@ def run_for_mode(
     def handle_batch(sources: list[str], meta_ids: list[str]):
         gen_tok = getattr(model, "tokenizer", tokenizer)
         if architecture == "causal_lm":
-            decoded = batched_generate_causal(model, gen_tok, sources, device, max_in, max_new)
+            cap_new = _causal_decode_max_new_tokens(task, max_new)
+            rep = 1.15 if task in ("LaMP-5", "LaMP-7") else None
+            decoded = batched_generate_causal(
+                model, gen_tok, sources, device, max_in, cap_new, repetition_penalty=rep
+            )
+            decoded = [_postprocess_causal_generation(task, d) for d in decoded]
         else:
             decoded = batched_generate(model, tokenizer, sources, device, max_in, max_new)
         preds.extend(zip(meta_ids, decoded))
@@ -585,6 +677,19 @@ def main():
     for r in rows:
         uid = data_io.infer_user_id(r, user_field=args.user_field)
         user_to_rows[uid].append(r)
+
+    if args.max_users is not None and args.max_users > 0:
+        n_users_full = len(user_to_rows)
+        n_rows_full = len(rows)
+        merged, rows, refs, id_order, user_to_rows = _restrict_to_first_k_users(
+            merged, rows, refs, id_order, args.user_field, args.max_users
+        )
+        print(
+            f"[run_evaluate] --max_users={args.max_users}: "
+            f"{len(user_to_rows)} user(s), {len(rows)} row(s) "
+            f"(full split: {n_users_full} user(s), {n_rows_full} row(s)).",
+            file=sys.stderr,
+        )
 
     modes = [m.strip().lower() for m in args.modes.split(",") if m.strip()]
     arch = resolved_architecture(args.base_model, args.architecture)
