@@ -76,7 +76,11 @@ def parse_args():
     p.add_argument("--output_dir", required=True)
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_retrieved", type=int, default=3)
-    p.add_argument("--retriever", default="bm25", choices=["bm25", "random", "recency"])
+    p.add_argument(
+        "--retriever",
+        default="contriever",
+        choices=["contriever", "bm25", "random", "recency"],
+    )
     p.add_argument("--ranked", action="store_true", help="Profile items are pre-ranked (LaMP merge step).")
     p.add_argument("--max_input_length", type=int, default=512)
     p.add_argument("--max_target_length", type=int, default=128)
