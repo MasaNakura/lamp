@@ -154,7 +154,9 @@ def main():
     args = parse_args()
     if args.fp16 and args.bf16:
         raise SystemExit("Use at most one of --fp16 and --bf16.")
-    if torch.cuda.is_available():
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    if use_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         try:
             torch.set_float32_matmul_precision("high")
@@ -173,6 +175,7 @@ def main():
     model = modeling_lora.attach_lora(
         base, r=args.lora_r, alpha=args.lora_alpha, dropout=0.05
     )
+    model = model.to(device)
     model.print_trainable_parameters()
 
     prompt_generator, contriever = create_prompt_generator(
@@ -183,7 +186,7 @@ def main():
         tokenizer,
     )
     if contriever is not None:
-        contriever = contriever.to("cpu")
+        contriever = contriever.to(device)
 
     train_ds = GeneralSeq2SeqDataset(
         train_path, use_profile=True, task=args.task, create_prompt=prompt_generator
@@ -207,7 +210,7 @@ def main():
     compute_metrics = create_metric_bleu_rouge_meteor(tokenizer=tokenizer)
 
     use_eval = val_hf is not None
-    cuda = torch.cuda.is_available()
+    cuda = use_cuda
     use_bf16 = bool(args.bf16 and cuda and torch.cuda.is_bf16_supported())
     if args.bf16 and cuda and not use_bf16:
         print("[train] --bf16 not supported on this GPU; training in fp32 (bf16 disabled).", file=sys.stderr)
