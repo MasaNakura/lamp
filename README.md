@@ -241,7 +241,8 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--fp16`, `--bf16` | CUDA half-precision inference (bf16 when the GPU supports it). **GPT-2 M6 (`TTTGPT2`)** loads in fp32 for stable inner steps. |
 | `--ttt_steps`, `--ttt_lr` | M4/M5: TTT minibatch count and LR. **Causal M6:** ``ttt_lr`` only (inner SGD); ``ttt_steps`` ignored for inner TTT (single pass per paper). |
 | `--m6_mam_checkpoint` | **Causal M6 only:** `latest.pt` (or other) from `train_mam_meta.py`. |
-| `--m6_inner_window`, `--m6_inner_stride` | Sliding NTP windows during **causal M6** inner adaptation (larger stride ⇒ fewer windows). |
+| `--m6_inner_window`, `--m6_inner_stride` | Sliding NTP windows during **causal M6** inner adaptation (each forward uses at most this many tokens; must be ≤ the backbone’s `n_positions`, e.g. **1024** for GPT-2). Larger stride ⇒ fewer windows. |
+| `--m6_profile_max_tokens` | Causal M6: tokenizer cap on the **merged profile** before inner TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. Set higher (e.g. **8192**) to retain more profile text (more windows / VRAM / time). |
 | `--user_field` | JSON field for user id when grouping test rows (M4/M5/**M6**). |
 | `--cache_dir` | Hugging Face cache directory. |
 | `--verbose`, `--verbose_max_samples` | Print per-example inputs, profile counts, encoder preview, preds vs gold, and per-row BLEU/ROUGE/METEOR (cap rows with `verbose_max_samples`, `-1` = all). |
