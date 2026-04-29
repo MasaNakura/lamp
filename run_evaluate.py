@@ -120,8 +120,16 @@ def parse_args():
         default=None,
         help="For causal m6 only: optional ``.pt`` state_dict from ``train_mam_meta.py`` (TTTGPT2).",
     )
-    p.add_argument("--m6_inner_window", type=int, default=256, help="Sliding NTP window for causal m6 inner loop.")
+    p.add_argument("--m6_inner_window", type=int, default=256, help="Sliding NTP window for causal m6 inner loop (must be ≤ backbone ``n_positions``, e.g. 1024 for GPT-2).")
     p.add_argument("--m6_inner_stride", type=int, default=128, help="Stride between windows for causal m6 inner loop.")
+    p.add_argument(
+        "--m6_profile_max_tokens",
+        type=int,
+        default=None,
+        help="Causal M6: max tokens when encoding the merged profile stream for inner TTT (tokenizer truncation). "
+        "If unset, uses min(4096, 8 × --max_input_length) for backward compatibility. "
+        "Inner passes still use ``--m6_inner_window``-sized chunks over this long sequence.",
+    )
     p.add_argument("--user_field", default=None)
     p.add_argument("--output_dir", default="eval_outputs")
     p.add_argument(
@@ -224,6 +232,13 @@ def _verbose_report_mode(
         print(f"  per_example_string_metrics: {per_ex}")
     if limit < n:
         print(f"\n[verbose] ... omitted {n - limit} further examples (see --verbose_max_samples).\n")
+
+
+def _m6_profile_token_cap(max_in: int, m6_profile_max_tokens: int | None) -> int:
+    """Upper bound on profile stream length (tokens) before sliding-window inner TTT."""
+    if m6_profile_max_tokens is not None:
+        return max(1, m6_profile_max_tokens)
+    return min(4096, max_in * 8)
 
 
 def merge_profiles(rows: list[dict]) -> list[dict]:
@@ -339,6 +354,7 @@ def run_for_mode(
     m6_mam_checkpoint: str | None = None,
     m6_inner_window: int = 256,
     m6_inner_stride: int = 128,
+    m6_profile_max_tokens: int | None = None,
 ) -> list[tuple[str, str]]:
     load_kw: dict = {"cache_dir": cache_dir}
     if torch_dtype is not None:
@@ -361,6 +377,15 @@ def run_for_mode(
                     sd = torch.load(m6_mam_checkpoint, map_location="cpu")
                 model.load_state_dict(sd, strict=True)
             model = model.to(device)
+            max_pos = int(
+                getattr(model.lm.config, "n_positions", None)
+                or getattr(model.lm.config, "max_position_embeddings", 1024)
+            )
+            if m6_inner_window > max_pos:
+                raise ValueError(
+                    f"--m6_inner_window ({m6_inner_window}) exceeds model max positions ({max_pos}); "
+                    f"GPT-2-style LMs are trained with that context cap per forward."
+                )
         else:
             model = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kw)
     else:
@@ -456,11 +481,12 @@ def run_for_mode(
                     prof = merge_profiles(urows)
                     stream = ttt_e2e.build_flat_history_stream(task, prof)
                     gen_tok = model.tokenizer
+                    prof_cap = _m6_profile_token_cap(max_in, m6_profile_max_tokens)
                     enc = gen_tok(
                         stream,
                         return_tensors="pt",
                         truncation=True,
-                        max_length=min(4096, max_in * 8),
+                        max_length=prof_cap,
                     )
                     ctx_ids = enc["input_ids"].to(device)
                     if ctx_ids.shape[1] >= 2:
@@ -608,6 +634,7 @@ def main():
             m6_mam_checkpoint=args.m6_mam_checkpoint,
             m6_inner_window=args.m6_inner_window,
             m6_inner_stride=args.m6_inner_stride,
+            m6_profile_max_tokens=args.m6_profile_max_tokens,
         )
         pred_map = {i: p for i, p in pairs}
         preds_ordered = [pred_map[i] for i in id_order]
