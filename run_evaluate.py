@@ -266,14 +266,17 @@ def _causal_decode_max_new_tokens(task: str, requested_max_new: int) -> int:
     return requested_max_new
 
 
-def _lamp5_title_eos_token_ids(tokenizer, pad_id: int) -> list[int]:
-    """EOS ids for LaMP-5 title decode: standard EOS/pad plus newline (stop after one line)."""
+def _lamp5_title_eos_token_ids(tokenizer) -> list[int]:
+    """EOS ids for LaMP-5 title decode: model EOS plus newline (one line of title).
+
+    Do **not** put ``pad_token_id`` here when it equals ``eos_token_id`` (common for GPT-2):
+    the first “real” logit step can map to EOS/pad and end generation with **zero** visible
+    title tokens. Newline still ends the line once at least one content token is forced via
+    ``min_new_tokens`` in ``generate``.
+    """
     out: list[int] = []
-    for t in (tokenizer.eos_token_id, pad_id):
-        if t is not None:
-            tt = int(t)
-            if tt not in out:
-                out.append(tt)
+    if tokenizer.eos_token_id is not None:
+        out.append(int(tokenizer.eos_token_id))
     for tid in tokenizer.encode("\n", add_special_tokens=False):
         tt = int(tid)
         if tt not in out:
@@ -427,7 +430,9 @@ def batched_generate_causal(
     if repetition_penalty is not None and repetition_penalty > 1.0:
         gen_kw["repetition_penalty"] = repetition_penalty
     if task == "LaMP-5":
-        gen_kw["eos_token_id"] = _lamp5_title_eos_token_ids(tokenizer, int(pad_id))
+        gen_kw["eos_token_id"] = _lamp5_title_eos_token_ids(tokenizer)
+        # Without this, the first sampled token can be ``\\n`` (in eos set) → immediate stop → "".
+        gen_kw["min_new_tokens"] = 1
     out_ids = model.generate(**enc, **gen_kw)
     # HF returns [batch, prompt_padded_len + new_len]. New tokens always start *after* the
     # padded prompt width (same for every row). Using per-row attention_mask.sum() is wrong
