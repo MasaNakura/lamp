@@ -31,7 +31,6 @@ from util.lamp_paths import ensure_lamp_on_path
 ensure_lamp_on_path()
 
 from data.datasets import GeneralSeq2SeqDataset, convert_to_hf_dataset, create_preprocessor  # noqa: E402
-from metrics.generation_metrics import create_metric_bleu_rouge_meteor  # noqa: E402
 from prompts.prompts import create_prompt_generator  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForSeq2SeqLM,
@@ -42,6 +41,7 @@ from transformers import (  # noqa: E402
 )
 
 from util import modeling_lora
+from util.metrics_eval import build_compute_metrics
 
 _DATA_DIR = os.path.join(_ROOT, "data")
 if _DATA_DIR not in sys.path:
@@ -207,7 +207,7 @@ def main():
     collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer, model=model, padding="longest", max_length=args.max_input_length
     )
-    compute_metrics = create_metric_bleu_rouge_meteor(tokenizer=tokenizer)
+    compute_metrics = build_compute_metrics(tokenizer)
 
     use_eval = val_hf is not None
     cuda = use_cuda

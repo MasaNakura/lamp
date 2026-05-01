@@ -5,6 +5,8 @@ import json
 import os
 from typing import Any
 
+import numpy as np
+
 from util.lamp_paths import ensure_lamp_on_path
 
 ensure_lamp_on_path()
@@ -12,8 +14,45 @@ ensure_lamp_on_path()
 from metrics.generation_metrics import create_metric_bleu_rouge_meteor  # noqa: E402
 
 
+def _sanitize_prediction_token_ids(preds, tokenizer):
+    """
+    Avoid Rust ``tokenizer.batch_decode`` OverflowError on invalid ids (e.g. logits
+    as 3D array, negatives, or values past ``len(tokenizer) - 1``). LaMP's metric
+    helper stays unchanged; we normalize here before delegating to it.
+    """
+    x = np.asarray(preds)
+    if x.size == 0:
+        return x.astype(np.int64)
+    if x.ndim == 3:
+        x = np.argmax(x, axis=-1)
+    elif x.ndim != 2:
+        raise ValueError(f"Expected predictions of rank 2 or 3, got shape {x.shape}")
+    if np.issubdtype(x.dtype, np.floating):
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        x = np.rint(x).astype(np.int64, copy=False)
+    else:
+        x = x.astype(np.int64, copy=False)
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = 0
+    pad = int(pad)
+    max_id = max(0, len(tokenizer) - 1)
+    x = np.where(x < 0, pad, x)
+    x = np.where(x > max_id, pad, x)
+    return x
+
+
 def build_compute_metrics(tokenizer):
-    return create_metric_bleu_rouge_meteor(tokenizer=tokenizer)
+    inner = create_metric_bleu_rouge_meteor(tokenizer=tokenizer)
+
+    def compute_metrics(eval_preds):
+        preds, labels = eval_preds
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        preds = _sanitize_prediction_token_ids(preds, tokenizer)
+        return inner((preds, labels))
+
+    return compute_metrics
 
 
 def evaluate_strings(preds: list[str], refs: list[str]) -> dict[str, float]:
