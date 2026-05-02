@@ -5,6 +5,7 @@ import argparse
 import csv
 import os
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -13,24 +14,34 @@ import torch
 from torch import amp as torch_amp
 from tqdm import tqdm
 
-from .flan_inner import inner_adapt_t5_functional
+from .flan_inner import _tokenize_self_supervised_batch, inner_adapt_t5_functional
 from .flan_dual_mlp_model import TTTFlanT5
 from .mam_data import meta_example_stream, meta_example_stream_lamp
+
+
+def _atomic_torch_save(obj: object, path: str) -> None:
+    """Write via tempfile + ``os.replace`` to avoid half-written checkpoints on flaky / full disks."""
+    path = os.path.abspath(path)
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".torch_save_", suffix=".pt.tmp", dir=d)
+    os.close(fd)
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _loss_text_copy(model, tokenizer, ids: torch.Tensor, max_length: int) -> torch.Tensor:
     text = tokenizer.decode(ids.view(-1).tolist(), skip_special_tokens=True)
     if not text.strip():
         return torch.zeros((), device=ids.device, requires_grad=True)
-    batch = tokenizer(
-        [text],
-        text_target=[text],
-        truncation=True,
-        max_length=max_length,
-        padding=True,
-        return_tensors="pt",
-    )
-    batch = {k: v.to(ids.device) for k, v in batch.items()}
+    batch = _tokenize_self_supervised_batch(tokenizer, text, ids.device, max_length)
     out = model(**batch)
     if out.loss is None:
         return torch.zeros((), device=ids.device, requires_grad=True)
@@ -211,8 +222,9 @@ def run_lamp(
             )
 
         if (step + 1) % ckpt_every == 0 or step == meta_steps - 1:
-            torch.save(model.state_dict(), os.path.join(ckpt_dir, f"ttt_flan_meta_{step + 1}.pt"))
-            torch.save(model.state_dict(), os.path.join(ckpt_dir, "latest.pt"))
+            state = model.state_dict()
+            _atomic_torch_save(state, os.path.join(ckpt_dir, f"ttt_flan_meta_{step + 1}.pt"))
+            _atomic_torch_save(state, os.path.join(ckpt_dir, "latest.pt"))
     log_file.close()
 
 
@@ -274,8 +286,9 @@ def run(
         log_file.flush()
         pbar.set_postfix(loss=f"{loss_v:.3f}")
         if (step + 1) % ckpt_every == 0 or step == meta_steps - 1:
-            torch.save(model.state_dict(), os.path.join(ckpt_dir, f"ttt_flan_meta_{step + 1}.pt"))
-            torch.save(model.state_dict(), os.path.join(ckpt_dir, "latest.pt"))
+            state = model.state_dict()
+            _atomic_torch_save(state, os.path.join(ckpt_dir, f"ttt_flan_meta_{step + 1}.pt"))
+            _atomic_torch_save(state, os.path.join(ckpt_dir, "latest.pt"))
     log_file.close()
 
 

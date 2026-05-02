@@ -6,18 +6,35 @@ import torch
 from ttt.e2e import build_flat_history_stream, iter_history_token_windows
 
 
-def _window_text_loss(model, tokenizer, window_ids: list[int], device: torch.device, window: int):
-    text = tokenizer.decode(window_ids, skip_special_tokens=True)
-    if not text.strip():
-        return None
+def _cap_lm_seq_len(tokenizer, max_length: int) -> int:
+    """T5/Flan: ``max_length`` alone does not cap ``labels``; also respect model max positions."""
+    mm = getattr(tokenizer, "model_max_length", None)
+    if mm is not None and mm < 100_000:
+        return min(int(max_length), int(mm))
+    return int(max_length)
+
+
+def _tokenize_self_supervised_batch(
+    tokenizer, text: str, device: torch.device, max_length: int
+) -> dict[str, torch.Tensor]:
+    cap = _cap_lm_seq_len(tokenizer, max_length)
     batch = tokenizer(
         [text],
         text_target=[text],
         truncation=True,
-        max_length=window,
+        max_length=cap,
+        max_target_length=cap,
         padding=True,
         return_tensors="pt",
-    ).to(device)
+    )
+    return {k: v.to(device) for k, v in batch.items()}
+
+
+def _window_text_loss(model, tokenizer, window_ids: list[int], device: torch.device, window: int):
+    text = tokenizer.decode(window_ids, skip_special_tokens=True)
+    if not text.strip():
+        return None
+    batch = _tokenize_self_supervised_batch(tokenizer, text, device, window)
     out = model(**batch)
     return out.loss
 
@@ -90,15 +107,9 @@ def inner_adapt_t5_functional(
         if len(chunk) >= 2:
             text = tokenizer.decode(chunk, skip_special_tokens=True)
             if text.strip():
-                batch = tokenizer(
-                    [text],
-                    text_target=[text],
-                    truncation=True,
-                    max_length=window,
-                    padding=True,
-                    return_tensors="pt",
+                batch = _tokenize_self_supervised_batch(
+                    tokenizer, text, context_ids.device, window
                 )
-                batch = {k: v.to(context_ids.device) for k, v in batch.items()}
                 out = fmodel(**batch)
                 loss = out.loss
                 if loss is not None and torch.isfinite(loss):
