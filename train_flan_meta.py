@@ -52,11 +52,23 @@ def parse_args():
         action="store_true",
         help="CUDA only: bfloat16 autocast when supported; no GradScaler (often best on Ampere+).",
     )
+    p.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Trade speed for VRAM: HF gradient checkpointing on the Flan-T5 stack (helps a lot with meta+higher).",
+    )
+    p.add_argument(
+        "--no_cuda_expandable_segments",
+        action="store_true",
+        help="By default we set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before GPU use; pass this to disable.",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if not args.no_cuda_expandable_segments:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_fp16 = bool(args.fp16 and device.type == "cuda")
@@ -96,6 +108,7 @@ def main():
         lamp_cache_path=lamp_cache,
         use_fp16=use_fp16,
         use_bf16=use_bf16,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     print(f"Done. Checkpoints and log under {args.output_dir}")
 

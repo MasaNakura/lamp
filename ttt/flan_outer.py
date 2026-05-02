@@ -127,6 +127,7 @@ def run_lamp(
     log_every: int = 50,
     use_fp16: bool = False,
     use_bf16: bool = False,
+    gradient_checkpointing: bool = False,
 ):
     dev = device or torch.device("cpu")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -142,6 +143,13 @@ def run_lamp(
 
     # fp32 weights: required for GradScaler + fp16 autocast; bf16 autocast needs no scaler.
     model = TTTFlanT5(model_name=model_name, ttt_fraction=ttt_fraction, torch_dtype=None).to(dev)
+    if gradient_checkpointing:
+        try:
+            model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.lm.gradient_checkpointing_enable()
+        model.lm.config.use_cache = False
+        print("[run_lamp] gradient checkpointing enabled on Flan-T5 (slower, lower VRAM).", file=sys.stderr)
     if use_bf16_eff:
         autocast_dtype = torch.bfloat16
         scaler = None
