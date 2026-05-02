@@ -56,17 +56,27 @@ def _meta_step(
     cont = cont.to(dev)
 
     outer_opt.zero_grad()
-    # autocast_dtype None => full fp32. GradScaler.unscale_ requires fp32 param grads, so do not
-    # load the backbone in float16 when using scaler (use fp32 weights + autocast only).
+    # fp32 weights + GradScaler: see run_lamp. For AMP, run inner windows under autocast
+    # but compute the meta seq2seq CE in full fp32: softmax/logits in float16 often overflow -> NaN.
     autocast_enabled = bool(autocast_dtype is not None and dev.type == "cuda")
     amp_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
-    with torch_amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=autocast_enabled):
-        with higher.innerloop_ctx(
-            model,
-            inner_opt,
-            copy_initial_weights=False,
-            track_higher_grads=True,
-        ) as (fmodel, diffopt):
+    with higher.innerloop_ctx(
+        model,
+        inner_opt,
+        copy_initial_weights=False,
+        track_higher_grads=True,
+    ) as (fmodel, diffopt):
+        if autocast_enabled:
+            with torch_amp.autocast(device_type="cuda", dtype=amp_dtype):
+                inner_adapt_t5_functional(
+                    fmodel,
+                    diffopt,
+                    tokenizer,
+                    ctx,
+                    window=window,
+                    stride=window,
+                )
+        else:
             inner_adapt_t5_functional(
                 fmodel,
                 diffopt,
@@ -75,6 +85,10 @@ def _meta_step(
                 window=window,
                 stride=window,
             )
+        if dev.type == "cuda":
+            with torch_amp.autocast(device_type="cuda", enabled=False):
+                meta_loss = _loss_text_copy(fmodel, tokenizer, cont, max_length=max_seq_len)
+        else:
             meta_loss = _loss_text_copy(fmodel, tokenizer, cont, max_length=max_seq_len)
 
     if scaler is not None:
@@ -133,7 +147,8 @@ def run_lamp(
         scaler = None
     elif use_fp16_eff:
         autocast_dtype = torch.float16
-        scaler = torch_amp.GradScaler("cuda", enabled=True)
+        # Meta + higher graphs can spike grads; a lower init scale reduces early inf skips.
+        scaler = torch_amp.GradScaler("cuda", enabled=True, init_scale=2.0**12)
     else:
         autocast_dtype = None
         scaler = None

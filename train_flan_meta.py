@@ -45,7 +45,7 @@ def parse_args():
     amp.add_argument(
         "--fp16",
         action="store_true",
-        help="CUDA only: AMP with fp32 weights, float16 autocast, and GradScaler (fp16 weights break GradScaler.unscale_).",
+        help="CUDA only: fp32 weights; float16 autocast on inner windows only; meta CE in fp32 + GradScaler (avoids NaN from fp16 softmax).",
     )
     amp.add_argument(
         "--bf16",
