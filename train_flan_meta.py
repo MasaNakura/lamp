@@ -41,10 +41,16 @@ def parse_args():
         default=None,
         help="Cache for tokenized train profiles; default: <output_dir>/lamp_profile_token_cache_flan.pt",
     )
-    p.add_argument(
+    amp = p.add_mutually_exclusive_group()
+    amp.add_argument(
         "--fp16",
         action="store_true",
-        help="CUDA only: load Flan-T5 in float16, autocast forwards, and GradScaler on the meta backward.",
+        help="CUDA only: AMP with fp32 weights, float16 autocast, and GradScaler (fp16 weights break GradScaler.unscale_).",
+    )
+    amp.add_argument(
+        "--bf16",
+        action="store_true",
+        help="CUDA only: bfloat16 autocast when supported; no GradScaler (often best on Ampere+).",
     )
     return p.parse_args()
 
@@ -54,8 +60,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_fp16 = bool(args.fp16 and device.type == "cuda")
+    use_bf16 = bool(args.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
     if args.fp16 and not use_fp16:
         print("[train_flan_meta] --fp16 requires CUDA; running in fp32.", file=sys.stderr)
+    if args.bf16 and device.type != "cuda":
+        print("[train_flan_meta] --bf16 requires CUDA; running in fp32.", file=sys.stderr)
+    elif args.bf16 and device.type == "cuda" and not use_bf16:
+        print("[train_flan_meta] --bf16 not supported on this GPU; running in fp32.", file=sys.stderr)
 
     merged = data_io.merge_questions_and_outputs(
         args.train_questions_json, args.train_outputs_json, task=args.task
@@ -84,6 +95,7 @@ def main():
         log_every=args.log_every,
         lamp_cache_path=lamp_cache,
         use_fp16=use_fp16,
+        use_bf16=use_bf16,
     )
     print(f"Done. Checkpoints and log under {args.output_dir}")
 

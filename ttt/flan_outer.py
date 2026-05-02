@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 import time
 from typing import Any
 
@@ -47,7 +48,7 @@ def _meta_step(
     window: int,
     max_seq_len: int,
     clip: float = 1.0,
-    use_fp16: bool = False,
+    autocast_dtype: torch.dtype | None = None,
     scaler: torch_amp.GradScaler | None = None,
 ) -> float:
     dev = next(model.parameters()).device
@@ -55,8 +56,11 @@ def _meta_step(
     cont = cont.to(dev)
 
     outer_opt.zero_grad()
-    autocast_enabled = bool(use_fp16 and dev.type == "cuda")
-    with torch_amp.autocast(device_type="cuda", dtype=torch.float16, enabled=autocast_enabled):
+    # autocast_dtype None => full fp32. GradScaler.unscale_ requires fp32 param grads, so do not
+    # load the backbone in float16 when using scaler (use fp32 weights + autocast only).
+    autocast_enabled = bool(autocast_dtype is not None and dev.type == "cuda")
+    amp_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
+    with torch_amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=autocast_enabled):
         with higher.innerloop_ctx(
             model,
             inner_opt,
@@ -108,15 +112,31 @@ def run_lamp(
     lamp_cache_path: str = ".cache/lamp_train_profiles_flan.pt",
     log_every: int = 50,
     use_fp16: bool = False,
+    use_bf16: bool = False,
 ):
     dev = device or torch.device("cpu")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
 
-    use_fp16_eff = bool(use_fp16 and dev.type == "cuda")
-    dtype_kw = torch.float16 if use_fp16_eff else None
-    model = TTTFlanT5(model_name=model_name, ttt_fraction=ttt_fraction, torch_dtype=dtype_kw).to(dev)
-    scaler = torch_amp.GradScaler("cuda", enabled=use_fp16_eff) if use_fp16_eff else None
+    use_bf16_eff = bool(use_bf16 and dev.type == "cuda" and torch.cuda.is_bf16_supported())
+    use_fp16_eff = bool(use_fp16 and dev.type == "cuda" and not use_bf16_eff)
+    if use_bf16 and dev.type == "cuda" and not use_bf16_eff:
+        print(
+            "[run_lamp] --bf16 not supported on this GPU; continuing in fp32 (no autocast).",
+            file=sys.stderr,
+        )
+
+    # fp32 weights: required for GradScaler + fp16 autocast; bf16 autocast needs no scaler.
+    model = TTTFlanT5(model_name=model_name, ttt_fraction=ttt_fraction, torch_dtype=None).to(dev)
+    if use_bf16_eff:
+        autocast_dtype = torch.bfloat16
+        scaler = None
+    elif use_fp16_eff:
+        autocast_dtype = torch.float16
+        scaler = torch_amp.GradScaler("cuda", enabled=True)
+    else:
+        autocast_dtype = None
+        scaler = None
     outer_opt = torch.optim.Adam(
         [
             {"params": list(model.outer_params()), "lr": outer_lr_outer},
@@ -153,7 +173,7 @@ def run_lamp(
             cont,
             window=window,
             max_seq_len=max(window, continuation_len),
-            use_fp16=use_fp16_eff,
+            autocast_dtype=autocast_dtype,
             scaler=scaler,
         )
         elapsed = time.time() - t0
