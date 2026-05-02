@@ -41,6 +41,11 @@ def parse_args():
         default=None,
         help="Cache for tokenized train profiles; default: <output_dir>/lamp_profile_token_cache_flan.pt",
     )
+    p.add_argument(
+        "--fp16",
+        action="store_true",
+        help="CUDA only: load Flan-T5 in float16, autocast forwards, and GradScaler on the meta backward.",
+    )
     return p.parse_args()
 
 
@@ -48,6 +53,9 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_fp16 = bool(args.fp16 and device.type == "cuda")
+    if args.fp16 and not use_fp16:
+        print("[train_flan_meta] --fp16 requires CUDA; running in fp32.", file=sys.stderr)
 
     merged = data_io.merge_questions_and_outputs(
         args.train_questions_json, args.train_outputs_json, task=args.task
@@ -75,6 +83,7 @@ def main():
         ckpt_every=args.ckpt_every,
         log_every=args.log_every,
         lamp_cache_path=lamp_cache,
+        use_fp16=use_fp16,
     )
     print(f"Done. Checkpoints and log under {args.output_dir}")
 

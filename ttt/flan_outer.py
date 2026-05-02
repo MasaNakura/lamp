@@ -9,6 +9,7 @@ from typing import Any
 
 import higher
 import torch
+from torch import amp as torch_amp
 from tqdm import tqdm
 
 from .flan_inner import inner_adapt_t5_functional
@@ -46,32 +47,45 @@ def _meta_step(
     window: int,
     max_seq_len: int,
     clip: float = 1.0,
+    use_fp16: bool = False,
+    scaler: torch_amp.GradScaler | None = None,
 ) -> float:
     dev = next(model.parameters()).device
     ctx = ctx.to(dev)
     cont = cont.to(dev)
 
     outer_opt.zero_grad()
-    with higher.innerloop_ctx(
-        model,
-        inner_opt,
-        copy_initial_weights=False,
-        track_higher_grads=True,
-    ) as (fmodel, diffopt):
-        inner_adapt_t5_functional(
-            fmodel,
-            diffopt,
-            tokenizer,
-            ctx,
-            window=window,
-            stride=window,
-        )
-        meta_loss = _loss_text_copy(fmodel, tokenizer, cont, max_length=max_seq_len)
+    autocast_enabled = bool(use_fp16 and dev.type == "cuda")
+    with torch_amp.autocast(device_type="cuda", dtype=torch.float16, enabled=autocast_enabled):
+        with higher.innerloop_ctx(
+            model,
+            inner_opt,
+            copy_initial_weights=False,
+            track_higher_grads=True,
+        ) as (fmodel, diffopt):
+            inner_adapt_t5_functional(
+                fmodel,
+                diffopt,
+                tokenizer,
+                ctx,
+                window=window,
+                stride=window,
+            )
+            meta_loss = _loss_text_copy(fmodel, tokenizer, cont, max_length=max_seq_len)
+
+    if scaler is not None:
+        scaler.scale(meta_loss).backward()
+        scaler.unscale_(outer_opt)
+    else:
         meta_loss.backward()
 
     torch.nn.utils.clip_grad_norm_(list(model.outer_params()) + list(model.inner_params()), clip)
-    outer_opt.step()
-    return float(meta_loss.detach().cpu())
+    if scaler is not None:
+        scaler.step(outer_opt)
+        scaler.update()
+    else:
+        outer_opt.step()
+    return float(meta_loss.detach().float().cpu())
 
 
 def run_lamp(
@@ -93,12 +107,16 @@ def run_lamp(
     ckpt_every: int = 200,
     lamp_cache_path: str = ".cache/lamp_train_profiles_flan.pt",
     log_every: int = 50,
+    use_fp16: bool = False,
 ):
     dev = device or torch.device("cpu")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
 
-    model = TTTFlanT5(model_name=model_name, ttt_fraction=ttt_fraction).to(dev)
+    use_fp16_eff = bool(use_fp16 and dev.type == "cuda")
+    dtype_kw = torch.float16 if use_fp16_eff else None
+    model = TTTFlanT5(model_name=model_name, ttt_fraction=ttt_fraction, torch_dtype=dtype_kw).to(dev)
+    scaler = torch_amp.GradScaler("cuda", enabled=use_fp16_eff) if use_fp16_eff else None
     outer_opt = torch.optim.Adam(
         [
             {"params": list(model.outer_params()), "lr": outer_lr_outer},
@@ -135,6 +153,8 @@ def run_lamp(
             cont,
             window=window,
             max_seq_len=max(window, continuation_len),
+            use_fp16=use_fp16_eff,
+            scaler=scaler,
         )
         elapsed = time.time() - t0
         ema_loss = loss_v if ema_loss is None else ema_decay * ema_loss + (1.0 - ema_decay) * loss_v
