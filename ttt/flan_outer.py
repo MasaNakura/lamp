@@ -16,7 +16,8 @@ from tqdm import tqdm
 
 from .flan_inner import _tokenize_self_supervised_batch, inner_adapt_t5_functional
 from .flan_dual_mlp_model import TTTFlanT5
-from .mam_data import meta_example_stream, meta_example_stream_lamp
+from .lamp_profile_rag import LampProfileRAG
+from .mam_data import meta_example_stream, meta_example_stream_lamp, meta_example_stream_lamp_rag
 
 
 def _atomic_torch_save(obj: object, path: str) -> None:
@@ -139,6 +140,8 @@ def run_lamp(
     use_fp16: bool = False,
     use_bf16: bool = False,
     gradient_checkpointing: bool = False,
+    profile_rag: LampProfileRAG | None = None,
+    cache_dir: str | None = None,
 ):
     dev = device or torch.device("cpu")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -153,7 +156,9 @@ def run_lamp(
         )
 
     # fp32 weights: required for GradScaler + fp16 autocast; bf16 autocast needs no scaler.
-    model = TTTFlanT5(model_name=model_name, ttt_fraction=ttt_fraction, torch_dtype=None).to(dev)
+    model = TTTFlanT5(
+        model_name=model_name, ttt_fraction=ttt_fraction, torch_dtype=None, cache_dir=cache_dir
+    ).to(dev)
     if gradient_checkpointing:
         try:
             model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -179,14 +184,24 @@ def run_lamp(
     )
     inner_opt = torch.optim.SGD(model.inner_params(), lr=inner_lr)
 
-    stream = meta_example_stream_lamp(
-        model.tokenizer,
-        train_rows,
-        task,
-        context_len=context_len,
-        continuation_len=continuation_len,
-        cache_path=lamp_cache_path,
-    )
+    if profile_rag is not None:
+        stream = meta_example_stream_lamp_rag(
+            model.tokenizer,
+            train_rows,
+            task,
+            profile_rag,
+            context_len=context_len,
+            continuation_len=continuation_len,
+        )
+    else:
+        stream = meta_example_stream_lamp(
+            model.tokenizer,
+            train_rows,
+            task,
+            context_len=context_len,
+            continuation_len=continuation_len,
+            cache_path=lamp_cache_path,
+        )
 
     log_file = open(log_path, "w", newline="", encoding="utf-8")
     log = csv.writer(log_file)

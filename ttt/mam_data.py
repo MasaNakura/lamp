@@ -148,3 +148,50 @@ def meta_example_stream_lamp(
         ctx = chunk[:context_len].unsqueeze(0)
         cont = chunk[context_len:].unsqueeze(0)
         yield ctx, cont
+
+
+def meta_example_stream_lamp_rag(
+    tokenizer,
+    train_rows: list[dict[str, Any]],
+    task: str,
+    rag: Any,
+    *,
+    context_len: int = 256,
+    continuation_len: int = 64,
+    seed: int = 0,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Like ``meta_example_stream_lamp`` but each (context, continuation) span is drawn from a
+    **single train row** after LaMP-style RAG narrows that row's profile. Aligns meta-training
+    with query-conditioned TTT at test time.
+    """
+    from .e2e import build_flat_history_stream
+
+    valid = [r for r in train_rows if (r.get("profile") or []) and (r.get("input") or "").strip()]
+    if not valid:
+        raise RuntimeError("meta_example_stream_lamp_rag: no rows with non-empty input and profile.")
+    total = context_len + continuation_len
+    rng = random.Random(seed)
+    attempts = 0
+    while True:
+        attempts += 1
+        if attempts > 50_000:
+            raise RuntimeError(
+                "meta_example_stream_lamp_rag: could not sample a span long enough after many tries. "
+                "Increase train profile text, lower --context_len/--continuation_len, or raise "
+                "--ttt_rag_num_retrieved."
+            )
+        row = rng.choice(valid)
+        inp = row["input"]
+        prof = row.get("profile") or []
+        subset = rag.select(inp, prof)
+        use_prof = subset if subset else prof
+        doc = build_flat_history_stream(task, use_prof)
+        ids = tokenizer.encode(doc, add_special_tokens=False)
+        if len(ids) < total + 1:
+            continue
+        start = rng.randint(0, len(ids) - total - 1)
+        chunk = ids[start : start + total]
+        ctx = torch.tensor(chunk[:context_len], dtype=torch.long).unsqueeze(0)
+        cont = torch.tensor(chunk[context_len:], dtype=torch.long).unsqueeze(0)
+        yield ctx, cont

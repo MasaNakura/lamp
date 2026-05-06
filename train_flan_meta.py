@@ -62,6 +62,21 @@ def parse_args():
         action="store_true",
         help="By default we set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before GPU use; pass this to disable.",
     )
+    p.add_argument("--cache_dir", default=None, help="HF cache dir (Flan-T5 and Contriever when using --ttt_rag contriever).")
+    p.add_argument(
+        "--ttt_rag",
+        action="store_true",
+        help="Meta-train with query-conditioned RAG profile narrowing (same retrieval as LaMP M3); "
+        "matches M4 eval with --m4_use_rag. Disables the flat-profile token cache stream.",
+    )
+    p.add_argument(
+        "--ttt_rag_retriever",
+        default="bm25",
+        choices=["contriever", "bm25", "random", "recency"],
+        help="Used with --ttt_rag (LaMP-aligned).",
+    )
+    p.add_argument("--ttt_rag_num_retrieved", type=int, default=3)
+    p.add_argument("--ttt_rag_ranked", action="store_true")
     return p.parse_args()
 
 
@@ -88,6 +103,19 @@ def main():
     log_path = os.path.join(args.output_dir, "meta_loss_lamp_flan.csv")
     lamp_cache = args.lamp_cache_path or os.path.join(args.output_dir, "lamp_profile_token_cache_flan.pt")
 
+    profile_rag = None
+    if args.ttt_rag:
+        from ttt.lamp_profile_rag import LampProfileRAG
+
+        profile_rag = LampProfileRAG(
+            args.task,
+            num_retrieved=args.ttt_rag_num_retrieved,
+            retriever=args.ttt_rag_retriever,
+            ranked=args.ttt_rag_ranked,
+            device=device,
+            cache_dir=args.cache_dir,
+        )
+
     run_lamp(
         rows,
         task=args.task,
@@ -109,6 +137,8 @@ def main():
         use_fp16=use_fp16,
         use_bf16=use_bf16,
         gradient_checkpointing=args.gradient_checkpointing,
+        profile_rag=profile_rag,
+        cache_dir=args.cache_dir,
     )
     print(f"Done. Checkpoints and log under {args.output_dir}")
 

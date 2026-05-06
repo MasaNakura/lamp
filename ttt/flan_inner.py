@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 from ttt.e2e import build_flat_history_stream, iter_history_token_windows
+from ttt.lamp_profile_rag import LampProfileRAG
 
 
 def _cap_lm_seq_len(tokenizer, max_length: int) -> int:
@@ -51,6 +52,8 @@ def inner_adapt_t5_inplace(
     window: int = 256,
     stride: int | None = None,
     profile_token_cap: int = 4096,
+    profile_rag: LampProfileRAG | None = None,
+    rag_query: str | None = None,
 ):
     """Single-pass sliding update on profile stream (one step per window)."""
     if stride is None:
@@ -58,7 +61,13 @@ def inner_adapt_t5_inplace(
     inner_params = list(model.inner_params())
     opt = torch.optim.SGD(inner_params, lr=lr)
 
-    stream = build_flat_history_stream(task, profile)
+    prof_use = profile
+    if profile_rag is not None and rag_query is not None and (rag_query.strip()):
+        picked = profile_rag.select(rag_query, profile)
+        if picked:
+            prof_use = picked
+
+    stream = build_flat_history_stream(task, prof_use)
     if not stream.strip():
         model.eval()
         return model

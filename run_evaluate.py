@@ -15,7 +15,7 @@ Models (paper storyboard):
   M1 Zero-shot base (task input only, no profile)
   M2 ICL (history serialized into the encoder budget)
   M3 RAG (+ optional LoRA adapter from train.py)
-  M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4).
+  M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4). Optional ``--m4_use_rag`` narrows the profile stream with the same retriever as M3 (``--retriever``, ``--num_retrieved``, ``--ranked``).
   Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m4_checkpoint``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
@@ -144,6 +144,18 @@ def parse_args():
         default=None,
         help="M4 (causal GPT-2 and seq2seq Flan-T5): max tokens for the merged **profile** stream before sliding inner TTT. "
         "If unset, uses min(4096, 8 × --max_input_length). Sliding uses ``--m4_inner_window`` / ``--m4_inner_stride``.",
+    )
+    p.add_argument(
+        "--m4_use_rag",
+        action="store_true",
+        help="M4: build the TTT profile stream from LaMP-style RAG over the merged user profile "
+        "(same retriever family as M3: --retriever, --num_retrieved, --ranked). Uses each user's "
+        "first test row ``input`` as the query unless --m4_rag_per_row.",
+    )
+    p.add_argument(
+        "--m4_rag_per_row",
+        action="store_true",
+        help="With --m4_use_rag: run inner TTT once per test row using that row's ``input`` as the RAG query (slower).",
     )
     p.add_argument("--user_field", default=None)
     p.add_argument(
@@ -482,6 +494,11 @@ def run_for_mode(
     m4_inner_window: int = 256,
     m4_inner_stride: int = 128,
     m4_profile_max_tokens: int | None = None,
+    m4_use_rag: bool = False,
+    m4_rag_per_row: bool = False,
+    rag_retriever: str = "bm25",
+    rag_num_retrieved: int = 3,
+    rag_ranked: bool = False,
 ) -> list[tuple[str, str]]:
     load_kw: dict = {"cache_dir": cache_dir}
     if torch_dtype is not None:
@@ -540,6 +557,19 @@ def run_for_mode(
     model.to(device)
     model.eval()
 
+    rag_selector = None
+    if mode == "m4" and m4_use_rag:
+        from ttt.lamp_profile_rag import LampProfileRAG
+
+        rag_selector = LampProfileRAG(
+            task,
+            num_retrieved=rag_num_retrieved,
+            retriever=rag_retriever,
+            ranked=rag_ranked,
+            device=device,
+            cache_dir=cache_dir,
+        )
+
     preds: list[tuple[str, str]] = []
 
     def handle_batch(sources: list[str], meta_ids: list[str]):
@@ -588,13 +618,49 @@ def run_for_mode(
             from ttt import e2e as ttt_e2e
             from ttt.mam_inner import inner_adapt_inplace
 
+            prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
+
+            if rag_selector is not None and m4_rag_per_row:
+                for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
+                    prof = merge_profiles(urows)
+                    for row in urows:
+                        snap = model.snapshot_inner()
+                        try:
+                            picked = rag_selector.select(row["input"], prof)
+                            use_prof = picked if picked else prof
+                            stream = ttt_e2e.build_flat_history_stream(task, use_prof)
+                            gen_tok = model.tokenizer
+                            enc = gen_tok(
+                                stream,
+                                return_tensors="pt",
+                                truncation=True,
+                                max_length=prof_cap,
+                            )
+                            ctx_ids = enc["input_ids"].to(device)
+                            if ctx_ids.shape[1] >= 2:
+                                inner_adapt_inplace(
+                                    model,
+                                    ctx_ids,
+                                    lr=ttt_lr,
+                                    window=m4_inner_window,
+                                    stride=m4_inner_stride,
+                                )
+                            model.eval()
+                            handle_batch([row["input"]], [row["id"]])
+                        finally:
+                            model.restore_inner(snap)
+                return preds
+
             for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
                 snap = model.snapshot_inner()
                 try:
                     prof = merge_profiles(urows)
-                    stream = ttt_e2e.build_flat_history_stream(task, prof)
+                    use_prof = prof
+                    if rag_selector is not None:
+                        picked = rag_selector.select(urows[0]["input"], prof)
+                        use_prof = picked if picked else prof
+                    stream = ttt_e2e.build_flat_history_stream(task, use_prof)
                     gen_tok = model.tokenizer
-                    prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
                     enc = gen_tok(
                         stream,
                         return_tensors="pt",
@@ -626,10 +692,36 @@ def run_for_mode(
 
         from ttt.flan_inner import inner_adapt_t5_inplace
 
+        prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
+
+        if rag_selector is not None and m4_rag_per_row:
+            for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
+                prof = merge_profiles(urows)
+                for row in urows:
+                    snap = model.snapshot_inner()
+                    try:
+                        inner_adapt_t5_inplace(
+                            model,
+                            model.tokenizer,
+                            task=task,
+                            profile=prof,
+                            device=device,
+                            lr=ttt_lr,
+                            window=m4_inner_window,
+                            stride=m4_inner_stride,
+                            profile_token_cap=prof_cap,
+                            profile_rag=rag_selector,
+                            rag_query=row["input"],
+                        )
+                        model.eval()
+                        handle_batch([row["input"]], [row["id"]])
+                    finally:
+                        model.restore_inner(snap)
+            return preds
+
         for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
             snap = model.snapshot_inner()
             prof = merge_profiles(urows)
-            prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
             try:
                 inner_adapt_t5_inplace(
                     model,
@@ -641,6 +733,8 @@ def run_for_mode(
                     window=m4_inner_window,
                     stride=m4_inner_stride,
                     profile_token_cap=prof_cap,
+                    profile_rag=rag_selector,
+                    rag_query=urows[0]["input"] if rag_selector is not None else None,
                 )
                 model.eval()
                 batch_src, batch_ids = [], []
@@ -752,6 +846,11 @@ def main():
             m4_inner_window=args.m4_inner_window,
             m4_inner_stride=args.m4_inner_stride,
             m4_profile_max_tokens=args.m4_profile_max_tokens,
+            m4_use_rag=args.m4_use_rag,
+            m4_rag_per_row=args.m4_rag_per_row,
+            rag_retriever=args.retriever,
+            rag_num_retrieved=args.num_retrieved,
+            rag_ranked=args.ranked,
         )
         pred_map = {i: p for i, p in pairs}
         preds_ordered = [pred_map[i] for i in id_order]
