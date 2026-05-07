@@ -222,7 +222,7 @@ Omit `--m4_checkpoint` if you did not run Step 1. Tune **`--ttt_lr`** and slidin
 
 With **`--base_model google/flan-t5-small`** and **`--architecture seq2seq`** (or **`auto`**), **`--modes m4`** uses **`TTTFlanT5`** + **`ttt/flan_inner.py`**: **one** left-to-right pass over the (truncated) profile stream, **one SGD step per sliding window** on the last-fraction **encoder+decoder FFN** trainable branch. Same **`--m4_inner_window`**, **`--m4_inner_stride`**, and **`--m4_profile_max_tokens`** as causal GPT-2 M4.
 
-**M4 + RAG** — Add **`--m4_use_rag`** to narrow the merged user profile with the **same** retriever settings as M3: **`--retriever`**, **`--num_retrieved`**, **`--ranked`**. By default the RAG query is the **first** test row’s `input` for that user; use **`--m4_rag_per_row`** to adapt once per row using that row’s `input` (slower). Retrieval uses the task `input` string only to **select** profile items; selected profile text is what inner TTT runs on (same idea as **`--ttt_rag`** during `train_flan_meta.py`).
+**M4 + RAG** — Add **`--m4_use_rag`** plus the same retriever settings as M3: **`--retriever`**, **`--num_retrieved`** (e.g. `16`), **`--ranked`**. For **each** test row: retrieve top‑K from that user’s merged profile using that row’s `input` as the query, run sliding-window inner TTT on the retrieved text, then generate from that `input`. Without **`--m4_use_rag`**, M4 still does one inner TTT per user on the **full** merged profile (no retrieval). Align **`--ttt_rag`** in `train_flan_meta.py` with these retriever settings if you meta-train with RAG.
 
 ### All modes (M1/M2/M3/M4)
 
@@ -254,7 +254,7 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--m4_ttt_fraction` | M4 only: fraction of final blocks whose FFNs are adapted (default `0.25`, paper-style choice). |
 | `--m4_inner_window`, `--m4_inner_stride` | **M4** sliding inner (Flan-T5 and GPT-2): window size and stride. For **GPT-2**, window must be ≤ `n_positions` (e.g. **1024**). Larger stride ⇒ fewer windows. |
 | `--m4_profile_max_tokens` | **M4 (Flan + GPT-2):** tokenizer cap on the **merged profile** before inner sliding TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. |
-| `--m4_use_rag`, `--m4_rag_per_row` | **M4:** optional LaMP-style RAG over the profile before inner TTT; reuses **`--retriever`**, **`--num_retrieved`**, **`--ranked`**. Per-row mode runs inner TTT once per test example. |
+| `--m4_use_rag` | **M4:** retrieve top‑K history per test row (M3 retriever flags), inner TTT on retrieved text, then generate. Omit for full-profile TTT once per user. |
 | `--user_field` | JSON field for user id when grouping test rows (**M4**). |
 | `--cache_dir` | Hugging Face cache directory. |
 | `--max_users` | If set to `K` (>0), only rows belonging to the **first K distinct users** (in merged test file order) are evaluated—handy for debugging without the full split. |

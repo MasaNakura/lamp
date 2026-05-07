@@ -15,7 +15,7 @@ Models (paper storyboard):
   M1 Zero-shot base (task input only, no profile)
   M2 ICL (history serialized into the encoder budget)
   M3 RAG (+ optional LoRA adapter from train.py)
-  M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4). Optional ``--m4_use_rag`` narrows the profile stream with the same retriever as M3 (``--retriever``, ``--num_retrieved``, ``--ranked``).
+  M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4). Optional ``--m4_use_rag``: per test row, retrieve top‑K history (M3 retriever flags), run sliding-window inner TTT on that text, then generate from that row's ``input``.
   Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m4_checkpoint``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
@@ -148,14 +148,9 @@ def parse_args():
     p.add_argument(
         "--m4_use_rag",
         action="store_true",
-        help="M4: build the TTT profile stream from LaMP-style RAG over the merged user profile "
-        "(same retriever family as M3: --retriever, --num_retrieved, --ranked). Uses each user's "
-        "first test row ``input`` as the query unless --m4_rag_per_row.",
-    )
-    p.add_argument(
-        "--m4_rag_per_row",
-        action="store_true",
-        help="With --m4_use_rag: run inner TTT once per test row using that row's ``input`` as the RAG query (slower).",
+        help="M4: for **each** test row, retrieve top‑K profile items (same as M3: --retriever, --num_retrieved, --ranked) "
+        "using that row's ``input`` as the query, run sliding-window inner TTT on the retrieved history, then generate. "
+        "Without this flag, inner TTT uses the full merged user profile once per user (no retrieval).",
     )
     p.add_argument("--user_field", default=None)
     p.add_argument(
@@ -495,7 +490,6 @@ def run_for_mode(
     m4_inner_stride: int = 128,
     m4_profile_max_tokens: int | None = None,
     m4_use_rag: bool = False,
-    m4_rag_per_row: bool = False,
     rag_retriever: str = "bm25",
     rag_num_retrieved: int = 3,
     rag_ranked: bool = False,
@@ -620,7 +614,7 @@ def run_for_mode(
 
             prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
 
-            if rag_selector is not None and m4_rag_per_row:
+            if rag_selector is not None:
                 for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
                     prof = merge_profiles(urows)
                     for row in urows:
@@ -655,11 +649,7 @@ def run_for_mode(
                 snap = model.snapshot_inner()
                 try:
                     prof = merge_profiles(urows)
-                    use_prof = prof
-                    if rag_selector is not None:
-                        picked = rag_selector.select(urows[0]["input"], prof)
-                        use_prof = picked if picked else prof
-                    stream = ttt_e2e.build_flat_history_stream(task, use_prof)
+                    stream = ttt_e2e.build_flat_history_stream(task, prof)
                     gen_tok = model.tokenizer
                     enc = gen_tok(
                         stream,
@@ -694,7 +684,7 @@ def run_for_mode(
 
         prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
 
-        if rag_selector is not None and m4_rag_per_row:
+        if rag_selector is not None:
             for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
                 prof = merge_profiles(urows)
                 for row in urows:
@@ -733,8 +723,6 @@ def run_for_mode(
                     window=m4_inner_window,
                     stride=m4_inner_stride,
                     profile_token_cap=prof_cap,
-                    profile_rag=rag_selector,
-                    rag_query=urows[0]["input"] if rag_selector is not None else None,
                 )
                 model.eval()
                 batch_src, batch_ids = [], []
@@ -847,7 +835,6 @@ def main():
             m4_inner_stride=args.m4_inner_stride,
             m4_profile_max_tokens=args.m4_profile_max_tokens,
             m4_use_rag=args.m4_use_rag,
-            m4_rag_per_row=args.m4_rag_per_row,
             rag_retriever=args.retriever,
             rag_num_retrieved=args.num_retrieved,
             rag_ranked=args.ranked,

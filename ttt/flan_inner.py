@@ -82,7 +82,9 @@ def inner_adapt_t5_inplace(
         model.eval()
         return model
 
-    model.train()
+    # eval(): disable dropout / stochastic depth while still backpropping inner FFNs (train() adds noise
+    # and can destabilize short RAG streams).
+    model.eval()
     for window_ids in iter_history_token_windows(tokenizer, stream, window=window, stride=stride):
         if len(window_ids) < 2:
             continue

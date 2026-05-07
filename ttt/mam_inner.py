@@ -51,7 +51,7 @@ def inner_adapt_inplace(
     inner_params = list(model.inner_params())
     opt = torch.optim.SGD(inner_params, lr=lr)
 
-    model.train()
+    model.eval()
     for window_ids in _iter_windows(context_ids, window, stride):
         if window_ids.size(-1) < 2:
             continue

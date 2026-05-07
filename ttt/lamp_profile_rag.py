@@ -19,17 +19,19 @@ def _mean_pooling(token_embeddings: torch.Tensor, mask: torch.Tensor) -> torch.T
     return token_embeddings.sum(dim=1) / mask.sum(dim=1)[..., None]
 
 
-def _extract_after_paper(input_string: str) -> str:
+def _extract_after_paper(input_string: str) -> str | None:
+    """Match LaMP ``extract_after_paper`` (None if marker missing)."""
     article_index = input_string.find("paper:")
     if article_index == -1:
-        return input_string.strip()
+        return None
     return input_string[article_index + len("paper:") :].strip()
 
 
-def _extract_after_colon(input_string: str) -> str:
+def _extract_after_colon(input_string: str) -> str | None:
+    """Match LaMP ``extract_after_colon`` (None if marker missing)."""
     article_index = input_string.find(":")
     if article_index == -1:
-        return input_string.strip()
+        return None
     return input_string[article_index + 1 :].strip()
 
 
@@ -42,7 +44,7 @@ def _corpus_and_query(task: str, inp: str, profile: list[dict[str, Any]]) -> tup
         query = _extract_after_colon(inp)
     else:
         raise ValueError(task)
-    if not (query or "").strip():
+    if query is None or not str(query).strip():
         query = inp.strip()
     return corpus, query
 
