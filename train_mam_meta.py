@@ -33,7 +33,11 @@ from ttt.mam_outer import run_lamp  # noqa: E402
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", choices=["LaMP-5", "LaMP-7"], default="LaMP-5")
+    p.add_argument(
+        "--task",
+        choices=["LaMP-5", "LaMP-7", "SD-tooluse", "SD-science"],
+        default="LaMP-5",
+    )
     p.add_argument("--train_questions_json", required=True)
     p.add_argument("--train_outputs_json", required=True)
     p.add_argument("--output_dir", default="mam_checkpoints")

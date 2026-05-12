@@ -24,6 +24,59 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 | `ttt/` | LoRA TTT (`training.py`); Flan **M4** (`flan_*.py` + `e2e.py` helpers); GPT-2 **TTT-E2E** (`mam_*.py`, `outer_meta.py`). |
 | `train_mam_meta.py` | Optional **outer-loop** meta-training of `TTTGPT2` on LaMP train profiles. |
 | `util/` | Add upstream LaMP to `sys.path`, metrics, LoRA, prompts. |
+| `Self-Distillation/` | Submodule: continual-learning benchmark data (tool-use + science QA) used here as **SD-tooluse** / **SD-science** tasks. |
+| `util/sd_self_distill.py` | Export HF `arrow` splits to LaMP-style JSON; helpers for SD RAG prompts. |
+| `util/sd_eval_metrics.py` | Accuracy scoring aligned with upstream `eval_tooluse.py` / `eval_science.py`. |
+
+## Self-Distillation → TTT Flan (SD-tooluse / SD-science)
+
+The [Self-Distillation](https://arxiv.org/abs/2601.19897) repo is included as a git submodule at `Self-Distillation/` (HF `datasets` on disk under `data/tooluse_data/` and `data/science_data/`). We treat each subtask as a separate benchmark:
+
+- **`SD-tooluse`:** `input` is the raw tool-use prompt string; gold `output` in JSON is a serialized `golden_answer` list (parsed like upstream). Correctness = multiset match on `Action:` lines and equality of merged `Action Input` JSON objects.
+- **`SD-science`:** `input` is the chat prompt flattened to `role: content` lines; gold is the string inside `<answer>...</answer>` in the reference (compare extracted span in the prediction to the gold string, as in `eval_science.py`).
+
+**Export** LaMP-shaped train/test JSON (questions + outputs) from the submodule:
+
+```bash
+git submodule update --init Self-Distillation
+python3 -m util.sd_self_distill --subtask tooluse --split train --out_dir data/sd_self_distill
+python3 -m util.sd_self_distill --subtask tooluse --split eval --out_dir data/sd_self_distill
+python3 -m util.sd_self_distill --subtask science --split train --out_dir data/sd_self_distill
+python3 -m util.sd_self_distill --subtask science --split eval --out_dir data/sd_self_distill
+```
+
+Optional: `--chunk_chars 480` (default) only subdivides a **single line** if it is longer than that many characters (most rows are **one non-empty line** each).
+
+This writes `tooluse_train_questions.json`, … Each row includes:
+
+- **`input`:** full task string (same as before; can exceed the encoder budget alone).
+- **`profile`:** one `{"text": "...", "row_idx": i}` entry per **non-empty line** of `input` (tool docs / options are usually line-separated), so **M3** / **M4+`--m4_use_rag`** retrieve **whole lines**, not arbitrary fixed-width chunks.
+- **`sd_rag_query`:** short BM25/Contriever query — tool-use `instruction` field, science last **user** message — so retrieval targets the question, not the entire prompt.
+- **`user_id`:** equal to `id` so **M4** without RAG still adapts **per-example** (no accidental merge of the whole split).
+
+**M3** builds the encoder text as: selected profile chunks (top‑`--num_retrieved`, then greedily packed) + `Task:` + full `input` (token-truncated only if the whole string still exceeds `--max_input_length`).
+
+**Meta-train Flan TTT** on the exported train split (one run per subtask):
+
+```bash
+python3 train_flan_meta.py --task SD-tooluse \
+  --train_questions_json data/sd_self_distill/tooluse_train_questions.json \
+  --train_outputs_json data/sd_self_distill/tooluse_train_outputs.json \
+  --output_dir exps/flan_meta_sd_tooluse
+```
+
+**Evaluate** (use larger `--max_new_tokens` for science than for LaMP titles; tool-use generations can be long):
+
+```bash
+python3 run_evaluate.py --task SD-tooluse \
+  --test_questions_json data/sd_self_distill/tooluse_test_questions.json \
+  --test_outputs_json data/sd_self_distill/tooluse_test_outputs.json \
+  --modes m1,m4 --base_model google/flan-t5-small \
+  --m4_checkpoint exps/flan_meta_sd_tooluse/latest.pt \
+  --max_new_tokens 512 --output_dir exps/eval_sd_tooluse
+```
+
+For science, consider `--max_new_tokens 1024` (or higher) so the model can emit a full `<answer>...</answer>` block. Optional: `--sd_save_responses` writes `eval_responses_<mode>.json` with per-row correctness.
 
 ## Model stages (one supervised `train.py`)
 
@@ -220,7 +273,7 @@ Omit `--m4_checkpoint` if you did not run Step 1. Tune **`--ttt_lr`** and slidin
 
 **M4 on Flan-T5 (paper-style sliding inner)**
 
-With **`--base_model google/flan-t5-small`** and **`--architecture seq2seq`** (or **`auto`**), **`--modes m4`** uses **`TTTFlanT5`** + **`ttt/flan_inner.py`**: **one** left-to-right pass over the (truncated) profile stream, **one SGD step per sliding window** on the last-fraction **encoder+decoder FFN** trainable branch. Same **`--m4_inner_window`**, **`--m4_inner_stride`**, and **`--m4_profile_max_tokens`** as causal GPT-2 M4.
+With **`--base_model google/flan-t5-small`** and **`--architecture seq2seq`** (or **`auto`**), **`--modes m4`** uses **`TTTFlanT5`** + **`ttt/flan_inner.py`**: **one** left-to-right pass over the merged profile, **one SGD step per sliding window** on the last-fraction **encoder+decoder FFN** trainable branch. **SD-tooluse / SD-science** (default): the profile is tokenized **without** a pre-truncation cap so sliding windows can cover the **full** document length; use **`--m4_profile_max_tokens`** to cap if needed. **LaMP** defaults to a cap before sliding (see flags table). Same **`--m4_inner_window`** and **`--m4_inner_stride`** as causal GPT-2 M4.
 
 **M4 + RAG** — Add **`--m4_use_rag`** plus the same retriever settings as M3: **`--retriever`**, **`--num_retrieved`** (e.g. `16`), **`--ranked`**. For **each** test row: retrieve top‑K from that user’s merged profile using that row’s `input` as the query, run sliding-window inner TTT on the retrieved text, then generate from that `input`. Without **`--m4_use_rag`**, M4 still does one inner TTT per user on the **full** merged profile (no retrieval). Align **`--ttt_rag`** in `train_flan_meta.py` with these retriever settings if you meta-train with RAG.
 
@@ -253,7 +306,7 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--m4_checkpoint` | **M4 (causal or seq2seq):** checkpoint path, e.g. `latest.pt` from `train_mam_meta.py` or `train_flan_meta.py` matching your `--architecture` and base model family. |
 | `--m4_ttt_fraction` | M4 only: fraction of final blocks whose FFNs are adapted (default `0.25`, paper-style choice). |
 | `--m4_inner_window`, `--m4_inner_stride` | **M4** sliding inner (Flan-T5 and GPT-2): window size and stride. For **GPT-2**, window must be ≤ `n_positions` (e.g. **1024**). Larger stride ⇒ fewer windows. |
-| `--m4_profile_max_tokens` | **M4 (Flan + GPT-2):** tokenizer cap on the **merged profile** before inner sliding TTT. If unset, defaults to `min(4096, 8 × max_input_length)`. |
+| `--m4_profile_max_tokens` | **M4:** hard cap (first *N* tokens) on the merged **profile** before inner TTT. Unset: **SD-tooluse / SD-science** = **no cap** (full profile, sliding windows only); **LaMP** = `min(4096, 8 × max_input_length)`. Set explicitly to limit VRAM/time on very long profiles. |
 | `--m4_use_rag` | **M4:** retrieve top‑K history per test row (M3 retriever flags), inner TTT on retrieved text, then generate. Omit for full-profile TTT once per user. |
 | `--user_field` | JSON field for user id when grouping test rows (**M4**). |
 | `--cache_dir` | Hugging Face cache directory. |

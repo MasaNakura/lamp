@@ -139,6 +139,8 @@ def filter_invalid_lamp_samples(rows: list[dict[str, Any]], task: str) -> list[d
 
     Used after merging questions + outputs so train and eval stay consistent.
     """
+    if task in ("SD-tooluse", "SD-science"):
+        return list(rows)
     if task == "LaMP-5":
         return _filter_lamp5_rows(rows)
     if task == "LaMP-7":

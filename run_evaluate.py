@@ -3,10 +3,12 @@ Evaluate personalization baselines on the LaMP **test** split: ``test_questions.
 (inputs + profiles) and ``test_outputs.json`` (gold labels by ``id``), per the
 [LaMP download](https://lamp-benchmark.github.io/download) and ``LaMP/README.md``.
 Rows are aligned by ``id`` (same idea as ``LaMP/LaMP/utils/merge_with_rank.py`` without ranking).
-The model only sees question-side fields; predictions are scored against the outputs file
-(BLEU, ROUGE, METEOR via LaMP metrics). Writes **``pred_outputs.json``** (LaMP gold format:
-``{"task": "LaMP_5"|"LaMP_7", "golds": [{"id", "output"}, ...]}`` with tab-indented JSON;
-multiple ``--modes`` in one run use ``pred_outputs_<mode>.json``).
+The model only sees question-side fields; predictions are scored against the outputs file.
+**LaMP-5 / LaMP-7:** BLEU, ROUGE, METEOR via LaMP metrics.
+**SD-tooluse / SD-science** (Self-Distillation submodule): task accuracy (same rules as
+``Self-Distillation/eval_tooluse.py`` and ``eval_science.py``). Writes **``pred_outputs.json``**
+(leaderboard-style ``task`` + ``golds`` with tab-indented JSON; multiple ``--modes`` use
+``pred_outputs_<mode>.json``).
 
 This script is named ``run_evaluate.py`` (not ``evaluate.py``) so LaMP's metric code can
 ``import evaluate`` and resolve the HuggingFace **evaluate** library instead of this file.
@@ -14,7 +16,10 @@ This script is named ``run_evaluate.py`` (not ``evaluate.py``) so LaMP's metric 
 Models (paper storyboard):
   M1 Zero-shot base (task input only, no profile)
   M2 ICL (history serialized into the encoder budget)
-  M3 RAG (+ optional LoRA adapter from train.py)
+  M3 RAG (+ optional LoRA adapter from train.py). **SD-tooluse / SD-science:** ``profile`` is
+  many newline-split line rows from the long ``input``; M3 retrieves top‑K rows with ``sd_rag_query``,
+  packs them under ``--max_input_length``, then appends ``Task:`` + full ``input`` (truncated
+  only if still too long).
   M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4). Optional ``--m4_use_rag``: per test row, retrieve top‑K history (M3 retriever flags), run sliding-window inner TTT on that text, then generate from that row's ``input``.
   Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m4_checkpoint``). No global LoRA.
 
@@ -50,12 +55,56 @@ if _DATA_DIR not in sys.path:
     sys.path.append(_DATA_DIR)
 import data_io  # noqa: E402
 
-from util import metrics_eval, prompting  # noqa: E402
+from util import metrics_eval, prompting, sd_eval_metrics  # noqa: E402
+from util import sd_self_distill  # noqa: E402
+
+
+def _is_sd_task(task: str) -> bool:
+    return task in ("SD-tooluse", "SD-science")
+
+
+def _sd_m2_encoder_max_length(
+    tokenizer,
+    cli_max: int,
+    *,
+    model=None,
+    hard_cap: int = 8192,
+) -> int:
+    """
+    Self-distillation M2 (ICL): use the largest encoder budget implied by the CLI cap,
+    a finite ``tokenizer.model_max_length``, and (when ``model`` is set) common seq2seq
+    config fields — capped for safety. When the hub uses a huge tokenizer sentinel, rely
+    on ``--max_input_length`` or the model config.
+    """
+    candidates: list[int] = [cli_max]
+    mml = getattr(tokenizer, "model_max_length", None)
+    if isinstance(mml, int) and 128 <= mml < 1_000_000:
+        candidates.append(mml)
+    if model is not None:
+        inner = model.get_base_model() if hasattr(model, "get_base_model") else model
+        cfg = getattr(inner, "config", None)
+        if cfg is not None:
+            for name in ("max_source_positions", "n_positions", "max_position_embeddings"):
+                v = getattr(cfg, name, None)
+                if isinstance(v, int) and v > 0:
+                    candidates.append(v)
+    return min(hard_cap, max(candidates))
+
+
+def _m4_rag_query(row: dict, task: str) -> str:
+    """Profile retrieval query: short ``sd_rag_query`` on SD rows; full ``input`` on LaMP."""
+    if _is_sd_task(task):
+        return sd_self_distill.sd_rag_query_for_row(row)
+    return row["input"]
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", choices=["LaMP-5", "LaMP-7"], required=True)
+    p.add_argument(
+        "--task",
+        choices=["LaMP-5", "LaMP-7", "SD-tooluse", "SD-science"],
+        required=True,
+    )
     p.add_argument(
         "--test_questions_json",
         required=True,
@@ -142,8 +191,9 @@ def parse_args():
         "--m4_profile_max_tokens",
         type=int,
         default=None,
-        help="M4 (causal GPT-2 and seq2seq Flan-T5): max tokens for the merged **profile** stream before sliding inner TTT. "
-        "If unset, uses min(4096, 8 × --max_input_length). Sliding uses ``--m4_inner_window`` / ``--m4_inner_stride``.",
+        help="M4: max tokens for the merged **profile** stream **before** sliding inner TTT (hard cap; "
+        "first N tokens only). If unset: **SD-tooluse / SD-science** = no cap (full document, window-limited forwards); "
+        "**LaMP** = min(4096, 8 × --max_input_length). Sliding still uses --m4_inner_window / --m4_inner_stride.",
     )
     p.add_argument(
         "--m4_use_rag",
@@ -173,6 +223,11 @@ def parse_args():
         default=40,
         help="With --verbose, max rows to print per mode (-1 = all; can be slow on large test sets).",
     )
+    p.add_argument(
+        "--sd_save_responses",
+        action="store_true",
+        help="For SD-tooluse / SD-science: write eval_responses_<mode>.json (prompt, pred, gold, correct).",
+    )
     return p.parse_args()
 
 
@@ -200,8 +255,11 @@ def _encoder_source_for_mode(
     if mode in ("m1", "m4"):
         return row["input"]
     if mode == "m2":
+        m2_tok = max_in
+        if _is_sd_task(task):
+            m2_tok = _sd_m2_encoder_max_length(tokenizer, max_in)
         return prompting.build_icl_source(
-            row, tokenizer, task=task, max_tokens=max_in, reserve_for_input=128
+            row, tokenizer, task=task, max_tokens=m2_tok, reserve_for_input=128
         )
     return rag_prompt(row)
 
@@ -223,11 +281,16 @@ def _verbose_report_mode(
     n = len(id_order)
     limit = n if max_samples < 0 else min(n, max_samples)
     score_one = metrics_eval.make_per_example_string_metric()
-    input_label = (
-        "LaMP task input (instruction + paper abstract)"
-        if task == "LaMP-5"
-        else "LaMP task input (instruction + target tweet)"
-    )
+    if task == "LaMP-5":
+        input_label = "LaMP task input (instruction + paper abstract)"
+    elif task == "LaMP-7":
+        input_label = "LaMP task input (instruction + target tweet)"
+    elif task == "SD-tooluse":
+        input_label = "Self-Distillation tool-use prompt"
+    elif task == "SD-science":
+        input_label = "Self-Distillation science (flattened chat) prompt"
+    else:
+        input_label = "task input"
     print(
         f"\n{'=' * 72}\n[verbose] mode={mode}  task={task}  "
         f"printing {limit} of {n} examples  corpus_metrics={corpus_metrics}\n{'=' * 72}"
@@ -241,7 +304,18 @@ def _verbose_report_mode(
         enc_src = _encoder_source_for_mode(
             mode, row, task=task, tokenizer=tokenizer, max_in=max_in, rag_prompt=rag_prompt
         )
-        per_ex = score_one(pred, ref)
+        if _is_sd_task(task):
+            if task == "SD-tooluse":
+                try:
+                    ok = sd_eval_metrics.tooluse_correct(pred, sd_eval_metrics.parse_tooluse_gold(ref))
+                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                    ok = False
+                per_ex = {"correct": float(ok)}
+            else:
+                ok = sd_eval_metrics.science_correct(pred, ref)
+                per_ex = {"correct": float(ok)}
+        else:
+            per_ex = score_one(pred, ref)
         print(f"\n--- sample index={i}  id={rid!r} ---")
         print(f"  profile_items (history size): {len(prof)}")
         if data_io.looks_like_file_id_placeholder(str(row.get("input", ""))):
@@ -259,15 +333,24 @@ def _verbose_report_mode(
         print(f"  encoder_source preview ({mode}): {_clip_text(enc_src, 520)}")
         print(f"  gold_output preview: {_clip_text(ref, 320)}")
         print(f"  prediction preview: {_clip_text(pred, 320)}")
-        print(f"  per_example_string_metrics: {per_ex}")
+        print(f"  per_example_metrics: {per_ex}")
     if limit < n:
         print(f"\n[verbose] ... omitted {n - limit} further examples (see --verbose_max_samples).\n")
 
 
-def _m4_profile_token_cap(max_in: int, m4_profile_max_tokens: int | None) -> int:
-    """Upper bound on profile stream length (tokens) before sliding-window inner TTT."""
+def _m4_profile_token_cap(max_in: int, m4_profile_max_tokens: int | None, task: str) -> int | None:
+    """
+    Token cap on the merged **profile** stream before Flan inner TTT sliding windows.
+
+    **SD-tooluse / SD-science:** default ``None`` = tokenize the **full** profile (no pre-cut);
+    sliding windows still limit each forward. Set ``--m4_profile_max_tokens`` to bound VRAM/time.
+
+    **LaMP-5 / LaMP-7:** default ``min(4096, 8 × max_input_length)`` when unset (historical behavior).
+    """
     if m4_profile_max_tokens is not None:
         return max(1, m4_profile_max_tokens)
+    if _is_sd_task(task):
+        return None
     return min(4096, max_in * 8)
 
 
@@ -566,6 +649,14 @@ def run_for_mode(
 
     preds: list[tuple[str, str]] = []
 
+    encode_max_len = max_in
+    if (
+        mode == "m2"
+        and _is_sd_task(task)
+        and architecture == "seq2seq"
+    ):
+        encode_max_len = _sd_m2_encoder_max_length(tokenizer, max_in, model=model)
+
     def handle_batch(sources: list[str], meta_ids: list[str]):
         gen_tok = getattr(model, "tokenizer", tokenizer)
         if architecture == "causal_lm":
@@ -583,7 +674,7 @@ def run_for_mode(
             )
             decoded = [_postprocess_causal_generation(task, d) for d in decoded]
         else:
-            decoded = batched_generate(model, gen_tok, sources, device, max_in, max_new)
+            decoded = batched_generate(model, gen_tok, sources, device, encode_max_len, max_new)
         preds.extend(zip(meta_ids, decoded))
 
     if mode in ("m1", "m2", "m3"):
@@ -594,7 +685,11 @@ def run_for_mode(
                 src = row["input"]
             elif mode == "m2":
                 src = prompting.build_icl_source(
-                    row, tokenizer, task=task, max_tokens=max_in, reserve_for_input=128
+                    row,
+                    tokenizer,
+                    task=task,
+                    max_tokens=encode_max_len,
+                    reserve_for_input=128,
                 )
             else:
                 src = rag_prompt(row)
@@ -612,7 +707,7 @@ def run_for_mode(
             from ttt import e2e as ttt_e2e
             from ttt.mam_inner import inner_adapt_inplace
 
-            prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
+            prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens, task)
 
             if rag_selector is not None:
                 for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
@@ -620,16 +715,18 @@ def run_for_mode(
                     for row in urows:
                         snap = model.snapshot_inner()
                         try:
-                            picked = rag_selector.select(row["input"], prof)
+                            picked = rag_selector.select(_m4_rag_query(row, task), prof)
                             use_prof = picked if picked else prof
-                            stream = ttt_e2e.build_flat_history_stream(task, use_prof)
+                            if _is_sd_task(task):
+                                stream = sd_self_distill.sd_ttt_inner_stream_text([row], use_prof)
+                            else:
+                                stream = ttt_e2e.build_flat_history_stream(task, use_prof)
                             gen_tok = model.tokenizer
-                            enc = gen_tok(
-                                stream,
-                                return_tensors="pt",
-                                truncation=True,
-                                max_length=prof_cap,
-                            )
+                            enc_kw: dict = {"return_tensors": "pt", "truncation": False}
+                            if prof_cap is not None:
+                                enc_kw["truncation"] = True
+                                enc_kw["max_length"] = prof_cap
+                            enc = gen_tok(stream, **enc_kw)
                             ctx_ids = enc["input_ids"].to(device)
                             if ctx_ids.shape[1] >= 2:
                                 inner_adapt_inplace(
@@ -649,14 +746,16 @@ def run_for_mode(
                 snap = model.snapshot_inner()
                 try:
                     prof = merge_profiles(urows)
-                    stream = ttt_e2e.build_flat_history_stream(task, prof)
+                    if _is_sd_task(task):
+                        stream = sd_self_distill.sd_ttt_inner_stream_text(urows, prof)
+                    else:
+                        stream = ttt_e2e.build_flat_history_stream(task, prof)
                     gen_tok = model.tokenizer
-                    enc = gen_tok(
-                        stream,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=prof_cap,
-                    )
+                    enc_kw2: dict = {"return_tensors": "pt", "truncation": False}
+                    if prof_cap is not None:
+                        enc_kw2["truncation"] = True
+                        enc_kw2["max_length"] = prof_cap
+                    enc = gen_tok(stream, **enc_kw2)
                     ctx_ids = enc["input_ids"].to(device)
                     if ctx_ids.shape[1] >= 2:
                         inner_adapt_inplace(
@@ -671,9 +770,9 @@ def run_for_mode(
                     for row in urows:
                         batch_src.append(row["input"])
                         batch_ids.append(row["id"])
-                        if len(batch_src) >= batch_size:
-                            handle_batch(batch_src, batch_ids)
-                            batch_src, batch_ids = [], []
+                    if len(batch_src) >= batch_size:
+                        handle_batch(batch_src, batch_ids)
+                        batch_src, batch_ids = [], []
                     if batch_src:
                         handle_batch(batch_src, batch_ids)
                 finally:
@@ -682,7 +781,7 @@ def run_for_mode(
 
         from ttt.flan_inner import inner_adapt_t5_inplace
 
-        prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens)
+        prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens, task)
 
         if rag_selector is not None:
             for _user, urows in tqdm(list(user_to_rows.items()), desc=mode):
@@ -690,18 +789,26 @@ def run_for_mode(
                 for row in urows:
                     snap = model.snapshot_inner()
                     try:
+                        picked = rag_selector.select(_m4_rag_query(row, task), prof)
+                        use_prof = picked if picked else prof
+                        ttt_txt = (
+                            sd_self_distill.sd_ttt_inner_stream_text([row], use_prof)
+                            if _is_sd_task(task)
+                            else None
+                        )
                         inner_adapt_t5_inplace(
                             model,
                             model.tokenizer,
                             task=task,
-                            profile=prof,
+                            profile=use_prof,
                             device=device,
                             lr=ttt_lr,
                             window=m4_inner_window,
                             stride=m4_inner_stride,
                             profile_token_cap=prof_cap,
-                            profile_rag=rag_selector,
-                            rag_query=row["input"],
+                            profile_rag=None if ttt_txt is not None else rag_selector,
+                            rag_query=None if ttt_txt is not None else _m4_rag_query(row, task),
+                            ttt_stream_text=ttt_txt,
                         )
                         model.eval()
                         handle_batch([row["input"]], [row["id"]])
@@ -713,6 +820,7 @@ def run_for_mode(
             snap = model.snapshot_inner()
             prof = merge_profiles(urows)
             try:
+                ttt_txt = sd_self_distill.sd_ttt_inner_stream_text(urows, prof) if _is_sd_task(task) else None
                 inner_adapt_t5_inplace(
                     model,
                     model.tokenizer,
@@ -723,6 +831,7 @@ def run_for_mode(
                     window=m4_inner_window,
                     stride=m4_inner_stride,
                     profile_token_cap=prof_cap,
+                    ttt_stream_text=ttt_txt,
                 )
                 model.eval()
                 batch_src, batch_ids = [], []
@@ -808,6 +917,18 @@ def main():
         contriever = contriever.to(device)
 
     def rag_prompt(row: dict) -> str:
+        if _is_sd_task(args.task):
+            return sd_self_distill.build_sd_rag_prompt(
+                row,
+                task=args.task,
+                num_retrieved=args.num_retrieved,
+                retriever=args.retriever,
+                ranked=args.ranked,
+                max_length=args.max_input_length,
+                tokenizer=tokenizer,
+                device=device,
+                cache_dir=args.cache_dir,
+            )
         return rag_gen(row["input"], row["profile"], args.task)
 
     results_summary: dict[str, dict] = {}
@@ -841,7 +962,19 @@ def main():
         )
         pred_map = {i: p for i, p in pairs}
         preds_ordered = [pred_map[i] for i in id_order]
-        metrics = metrics_eval.evaluate_strings(preds_ordered, refs)
+        scores_sd: list[int] | None = None
+        if _is_sd_task(args.task):
+            if args.task == "SD-tooluse":
+                scores_sd, acc = sd_eval_metrics.tooluse_accuracy(preds_ordered, refs)
+            else:
+                scores_sd, acc = sd_eval_metrics.science_accuracy(preds_ordered, refs)
+            metrics = {
+                "accuracy": float(acc),
+                "num_correct": int(sum(scores_sd)),
+                "num_total": len(scores_sd),
+            }
+        else:
+            metrics = metrics_eval.evaluate_strings(preds_ordered, refs)
         results_summary[mode] = metrics
         # LaMP leaderboard format (same as gold ``*_outputs.json``): ``pred_outputs.json``
         # when a single mode; otherwise one file per mode to avoid clobbering.
@@ -855,6 +988,26 @@ def main():
         with open(os.path.join(args.output_dir, f"metrics_{mode}.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
         print(mode, metrics)
+        if args.sd_save_responses and _is_sd_task(args.task) and scores_sd is not None:
+            resp_path = os.path.join(args.output_dir, f"eval_responses_{mode}.json")
+            with open(resp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {
+                            "id": id_order[j],
+                            "input": rows[j]["input"],
+                            "pred": preds_ordered[j],
+                            "gold": refs[j],
+                            "correct": bool(scores_sd[j]),
+                        }
+                        for j in range(len(id_order))
+                    ],
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                f.write("\n")
+            print(f"Wrote {resp_path}")
         if args.verbose:
             _verbose_report_mode(
                 mode,

@@ -154,8 +154,17 @@ def build_flat_history_stream(task: str, profile: list[dict[str, Any]]) -> str:
             tx = (p.get("text") or "").strip()
             if tx:
                 parts.append(f"[tweet] {tx}")
+    elif task in ("SD-tooluse", "SD-science"):
+        # Plain newline join (no ``[ctx]``) so tokenization matches SD ``input`` line order;
+        # M4 inner TTT for SD should prefer ``ttt_stream_text`` + ``sd_ttt_inner_stream_text``.
+        for p in profile:
+            tx = (p.get("text") or "").strip()
+            if tx:
+                parts.append(tx)
     else:
         raise ValueError(task)
+    if task in ("SD-tooluse", "SD-science"):
+        return "\n".join(parts)
     return "\n\n".join(parts)
 
 
@@ -171,14 +180,33 @@ def iter_history_token_windows(
         add_special_tokens=False,
         return_attention_mask=False,
         verbose=False,
+        truncation=False,
     )["input_ids"]
+    yield from iter_history_token_id_windows(ids, window=window, stride=stride)
+
+
+def iter_history_token_id_windows(
+    ids: list[int],
+    *,
+    window: int,
+    stride: int,
+) -> Iterator[list[int]]:
+    """
+    Left-to-right sliding windows over a **full** token sequence (no truncation here).
+
+    Used by Flan inner TTT so every token of the profile stream can receive an update
+    pass when combined with ``truncation=False`` upstream encoding.
+    """
     if not ids:
         return
     if stride <= 0:
         stride = window
+    n = len(ids)
     i = 0
-    while i < len(ids):
+    while i < n:
         yield ids[i : i + window]
+        if i + window >= n:
+            break
         i += stride
 
 

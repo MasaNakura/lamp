@@ -42,6 +42,9 @@ def _corpus_and_query(task: str, inp: str, profile: list[dict[str, Any]]) -> tup
     elif task == "LaMP-7":
         corpus = [f'{p.get("text", "")}' for p in profile]
         query = _extract_after_colon(inp)
+    elif task in ("SD-tooluse", "SD-science"):
+        corpus = [(p.get("text") or "").strip() for p in profile]
+        query = inp.strip()
     else:
         raise ValueError(task)
     if query is None or not str(query).strip():

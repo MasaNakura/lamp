@@ -98,14 +98,20 @@ def _lamp_train_token_cache(
             return torch.load(cache_path)
 
     # LaMP-7 rows are short tweets per profile item; use lower floors than LaMP-5 title+abstract.
-    min_doc_chars = 24 if task == "LaMP-7" else 80
-    min_row_tokens = 12 if task == "LaMP-7" else 32
-    min_total_tokens = 256 if task == "LaMP-7" else 512
+    if task in ("SD-tooluse", "SD-science"):
+        min_doc_chars, min_row_tokens, min_total_tokens = 16, 8, 128
+    elif task == "LaMP-7":
+        min_doc_chars, min_row_tokens, min_total_tokens = 24, 12, 256
+    else:
+        min_doc_chars, min_row_tokens, min_total_tokens = 80, 32, 512
 
     buf: list[int] = []
     for row in rows:
-        prof = row.get("profile") or []
-        doc = _lamp_profile_document(task, prof if isinstance(prof, list) else [])
+        if task in ("SD-tooluse", "SD-science"):
+            doc = (row.get("input") or "").strip()
+        else:
+            prof = row.get("profile") or []
+            doc = _lamp_profile_document(task, prof if isinstance(prof, list) else [])
         if len(doc) < min_doc_chars:
             continue
         ids = tokenizer.encode(doc)
@@ -167,6 +173,8 @@ def meta_example_stream_lamp_rag(
     """
     from .e2e import build_flat_history_stream
 
+    from util.sd_self_distill import sd_ttt_inner_stream_text
+
     valid = [r for r in train_rows if (r.get("profile") or []) and (r.get("input") or "").strip()]
     if not valid:
         raise RuntimeError("meta_example_stream_lamp_rag: no rows with non-empty input and profile.")
@@ -182,11 +190,14 @@ def meta_example_stream_lamp_rag(
                 "--ttt_rag_num_retrieved."
             )
         row = rng.choice(valid)
-        inp = row["input"]
+        inp = (row.get("sd_rag_query") or "").strip() or (row.get("input") or "").strip()
         prof = row.get("profile") or []
         subset = rag.select(inp, prof)
         use_prof = subset if subset else prof
-        doc = build_flat_history_stream(task, use_prof)
+        if task in ("SD-tooluse", "SD-science"):
+            doc = sd_ttt_inner_stream_text([row], use_prof)
+        else:
+            doc = build_flat_history_stream(task, use_prof)
         ids = tokenizer.encode(doc, add_special_tokens=False)
         if len(ids) < total + 1:
             continue
