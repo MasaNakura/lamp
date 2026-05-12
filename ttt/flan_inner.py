@@ -1,6 +1,8 @@
 """Inner adaptation loops for Flan-T5 Dual-FFN TTT-E2E."""
 from __future__ import annotations
 
+import warnings
+
 import torch
 
 from ttt.e2e import build_flat_history_stream, iter_history_token_id_windows
@@ -122,7 +124,11 @@ def inner_adapt_t5_inplace(
     """Single-pass sliding update on profile stream (one step per window).
 
     ``profile_token_cap``: if ``None``, tokenize the **entire** flattened profile with
-    ``truncation=False`` and slide over **all** token ids (only each forward is window-limited).
+    ``truncation=False`` and slide over **all** token ids (only each forward is window-limited
+    to the model context, e.g. 512 for Flan-T5). HuggingFace may emit a **UserWarning** when the
+    total stream exceeds the pretrained max; that is expected here and is filtered for this
+    encode only (each sliding-window forward stays within the cap).
+
     If a positive int, keep only the **first** that many tokens before sliding (legacy / VRAM cap).
 
     ``ttt_stream_text``: if set, use this string as the inner-loop stream. For SD+RAG, the
@@ -147,17 +153,18 @@ def inner_adapt_t5_inplace(
         model.eval()
         return model
 
-    # Unbounded ``encode`` can exceed the LM's context (e.g. 591 > 512) and HF warns before
-    # sliding windows run. Cap the **stream** tokenization to the same limit as inner forwards.
-    stream_cap = resolve_seq2seq_token_cap(model, tokenizer, 1_000_000)
-    ids = tokenizer.encode(
-        stream,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=stream_cap,
-    )
+    # Full-document stream: keep **all** token ids, then slide with windows ≤ model context.
+    # HF warns when ``encode`` produces more tokens than the checkpoint's nominal max even though
+    # we never feed that many to ``forward`` at once — suppress only that known advisory here.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            message=r".*Token indices sequence length is longer than the specified maximum sequence length.*",
+        )
+        ids = tokenizer.encode(stream, add_special_tokens=False, truncation=False)
     if profile_token_cap is not None and int(profile_token_cap) > 0:
-        ids = ids[: min(int(profile_token_cap), len(ids))]
+        ids = ids[: int(profile_token_cap)]
     if not ids or len(ids) < 2:
         model.eval()
         return model
