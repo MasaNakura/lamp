@@ -19,12 +19,13 @@ def _tokenize_self_supervised_batch(
     tokenizer, text: str, device: torch.device, max_length: int
 ) -> dict[str, torch.Tensor]:
     cap = _cap_lm_seq_len(tokenizer, max_length)
+    # One ``max_length`` for both sides (``text_target``); HF tokenizers no longer accept
+    # ``max_target_length`` here (warning: keyword not recognized).
     batch = tokenizer(
         [text],
         text_target=[text],
         truncation=True,
         max_length=cap,
-        max_target_length=cap,
         padding=True,
         return_tensors="pt",
     )
