@@ -42,7 +42,7 @@ def _loss_text_copy(model, tokenizer, ids: torch.Tensor, max_length: int) -> tor
     text = tokenizer.decode(ids.view(-1).tolist(), skip_special_tokens=True)
     if not text.strip():
         return torch.zeros((), device=ids.device, requires_grad=True)
-    batch = _tokenize_self_supervised_batch(tokenizer, text, ids.device, max_length)
+    batch = _tokenize_self_supervised_batch(tokenizer, text, ids.device, max_length, model=model)
     out = model(**batch)
     if out.loss is None:
         return torch.zeros((), device=ids.device, requires_grad=True)

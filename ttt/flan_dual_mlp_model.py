@@ -44,7 +44,14 @@ class TTTFlanT5(nn.Module):
         if torch_dtype is not None:
             load_kw["torch_dtype"] = torch_dtype
         self.lm = AutoModelForSeq2SeqLM.from_pretrained(model_name, **load_kw)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, use_fast=False)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, cache_dir=cache_dir, use_fast=False, legacy=False
+            )
+        except TypeError:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, cache_dir=cache_dir, use_fast=False
+            )
 
         self._replace_ffn_cores(ttt_fraction)
         self._mark_param_roles()

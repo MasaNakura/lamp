@@ -157,11 +157,9 @@ def main():
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
+        from util.cuda_tf32 import enable_tf32
+
+        enable_tf32()
 
     os.makedirs(args.output_dir, exist_ok=True)
     train_path, dev_path = _write_merged_train_and_maybe_dev(args)

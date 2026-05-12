@@ -857,11 +857,9 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
+        from util.cuda_tf32 import enable_tf32
+
+        enable_tf32()
 
     torch_dtype = _infer_torch_dtype(device, want_fp16=args.fp16, want_bf16=args.bf16)
 
@@ -903,7 +901,14 @@ def main():
             "Causal LM (gpt2-style) is only wired for m1 and m4; use --architecture seq2seq for m2/m3."
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, cache_dir=args.cache_dir, use_fast=False)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.base_model, cache_dir=args.cache_dir, use_fast=False, legacy=False
+        )
+    except TypeError:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.base_model, cache_dir=args.cache_dir, use_fast=False
+        )
     if arch == "causal_lm" and tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     rag_gen, contriever = create_prompt_generator(
