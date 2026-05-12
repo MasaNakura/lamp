@@ -8,7 +8,7 @@ from ttt.lamp_profile_rag import LampProfileRAG
 
 
 def _seq2seq_positions_cap(model) -> int | None:
-    """T5/Flan pretrained configs often set ``n_positions`` (e.g. 512); cap inner LM batches to it."""
+    """Read explicit position cap from config when present (e.g. ``n_positions`` on Flan-T5)."""
     if model is None:
         return None
     lm = getattr(model, "lm", model)
@@ -23,16 +23,39 @@ def _seq2seq_positions_cap(model) -> int | None:
     return None
 
 
-def _cap_lm_seq_len(tokenizer, max_length: int, *, model=None) -> int:
-    """Clamp LM batch length to tokenizer limit and to the seq2seq model's position cap."""
-    cap = int(max_length)
+def resolve_seq2seq_token_cap(model, tokenizer, requested: int) -> int:
+    """
+    Hard cap for encoder/decoder token length on seq2seq forwards (T5/Flan, PEFT-wrapped, ``TTTFlanT5``).
+
+    Some checkpoints omit ``n_positions``; standard Flan-T5 is still 512. ``--max_input_length``
+    can be larger (e.g. SD M2), but the LM must not see more than this cap or HF warns / misbehaves.
+    """
+    cap = max(2, int(requested))
     mpos = _seq2seq_positions_cap(model)
     if mpos is not None:
         cap = min(cap, mpos)
+    else:
+        lm = getattr(model, "lm", model)
+        base = lm.get_base_model() if hasattr(lm, "get_base_model") else lm
+        cfg = getattr(base, "config", None)
+        mt = (getattr(cfg, "model_type", None) or "").lower() if cfg is not None else ""
+        if mt in ("t5", "mt5"):
+            cap = min(cap, 512)
     mm = getattr(tokenizer, "model_max_length", None)
-    if mm is not None and mm < 100_000:
-        cap = min(cap, int(mm))
-    return max(cap, 2)
+    if isinstance(mm, int) and 128 <= mm < 100_000:
+        cap = min(cap, mm)
+    return max(2, cap)
+
+
+def _cap_lm_seq_len(tokenizer, max_length: int, *, model=None) -> int:
+    """Clamp LM batch length for inner self-supervised steps."""
+    if model is None:
+        cap = int(max_length)
+        mm = getattr(tokenizer, "model_max_length", None)
+        if mm is not None and mm < 100_000:
+            cap = min(cap, int(mm))
+        return max(cap, 2)
+    return resolve_seq2seq_token_cap(model, tokenizer, max_length)
 
 
 def _tokenize_self_supervised_batch(
@@ -49,6 +72,14 @@ def _tokenize_self_supervised_batch(
         padding=True,
         return_tensors="pt",
     )
+    if model is not None:
+        hard = resolve_seq2seq_token_cap(model, tokenizer, 1_000_000)
+        if batch["input_ids"].shape[1] > hard:
+            for key in ("input_ids", "attention_mask"):
+                if key in batch:
+                    batch[key] = batch[key][:, :hard]
+            if "labels" in batch:
+                batch["labels"] = batch["labels"][:, :hard]
     return {k: v.to(device) for k, v in batch.items()}
 
 
@@ -112,8 +143,7 @@ def inner_adapt_t5_inplace(
         model.eval()
         return model
 
-    mpos = _seq2seq_positions_cap(model)
-    eff_window = min(int(window), mpos) if mpos is not None else int(window)
+    eff_window = resolve_seq2seq_token_cap(model, tokenizer, int(window))
     eff_stride = min(int(stride), eff_window) if stride is not None else eff_window
 
     # eval(): disable dropout / stochastic depth while still backpropping inner FFNs (train() adds noise
@@ -144,8 +174,7 @@ def inner_adapt_t5_functional(
     """Differentiable single-pass inner loop over tokenized context ids."""
     if stride is None:
         stride = window
-    mpos = _seq2seq_positions_cap(fmodel)
-    eff_window = min(int(window), mpos) if mpos is not None else int(window)
+    eff_window = resolve_seq2seq_token_cap(fmodel, tokenizer, int(window))
     eff_stride = min(int(stride), eff_window)
     ids = context_ids.detach().view(-1).tolist()
     n = len(ids)

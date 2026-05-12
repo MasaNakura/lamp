@@ -489,10 +489,13 @@ def resolved_architecture(base_model: str, architecture: str) -> str:
 
 @torch.inference_mode()
 def batched_generate(model, tokenizer, sources: list[str], device: torch.device, max_in: int, max_new: int):
+    from ttt.flan_inner import resolve_seq2seq_token_cap
+
+    cap = resolve_seq2seq_token_cap(model, tokenizer, max_in)
     enc = tokenizer(
         sources,
         truncation=True,
-        max_length=max_in,
+        max_length=cap,
         padding=True,
         return_tensors="pt",
     ).to(device)
