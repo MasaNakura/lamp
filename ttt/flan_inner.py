@@ -23,6 +23,18 @@ def _seq2seq_positions_cap(model) -> int | None:
     return None
 
 
+def _config_looks_like_t5(cfg) -> bool:
+    if cfg is None:
+        return False
+    mt = (getattr(cfg, "model_type", None) or "").lower()
+    if mt in ("t5", "mt5"):
+        return True
+    archs = getattr(cfg, "architectures", None) or []
+    if isinstance(archs, (list, tuple)):
+        return any("T5" in str(a) for a in archs)
+    return False
+
+
 def resolve_seq2seq_token_cap(model, tokenizer, requested: int) -> int:
     """
     Hard cap for encoder/decoder token length on seq2seq forwards (T5/Flan, PEFT-wrapped, ``TTTFlanT5``).
@@ -38,8 +50,7 @@ def resolve_seq2seq_token_cap(model, tokenizer, requested: int) -> int:
         lm = getattr(model, "lm", model)
         base = lm.get_base_model() if hasattr(lm, "get_base_model") else lm
         cfg = getattr(base, "config", None)
-        mt = (getattr(cfg, "model_type", None) or "").lower() if cfg is not None else ""
-        if mt in ("t5", "mt5"):
+        if _config_looks_like_t5(cfg):
             cap = min(cap, 512)
     mm = getattr(tokenizer, "model_max_length", None)
     if isinstance(mm, int) and 128 <= mm < 100_000:
@@ -136,9 +147,17 @@ def inner_adapt_t5_inplace(
         model.eval()
         return model
 
-    ids = tokenizer.encode(stream, add_special_tokens=False, truncation=False)
+    # Unbounded ``encode`` can exceed the LM's context (e.g. 591 > 512) and HF warns before
+    # sliding windows run. Cap the **stream** tokenization to the same limit as inner forwards.
+    stream_cap = resolve_seq2seq_token_cap(model, tokenizer, 1_000_000)
+    ids = tokenizer.encode(
+        stream,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=stream_cap,
+    )
     if profile_token_cap is not None and int(profile_token_cap) > 0:
-        ids = ids[: int(profile_token_cap)]
+        ids = ids[: min(int(profile_token_cap), len(ids))]
     if not ids or len(ids) < 2:
         model.eval()
         return model
