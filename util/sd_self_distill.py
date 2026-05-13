@@ -101,19 +101,98 @@ def sd_m2_preserving_tail(row: dict[str, Any], *, task: str) -> str:
     raise ValueError(f"sd_m2_preserving_tail: unknown task {task!r}")
 
 
-def sd_m2_icl_encoder_from_raw_input(inp: str, tokenizer, max_tokens: int) -> str:
+def _normalize_sd_input_newlines(s: str) -> str:
+    """Normalize CR/LF only; do not strip spaces or newlines."""
+    return (s or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _icl_token_len(tokenizer, s: str) -> int:
+    return len(tokenizer(s, add_special_tokens=False, verbose=False)["input_ids"])
+
+
+def _icl_min_cut_drop_left(
+    tokenizer, inp: str, lo: int, hi: int, max_tokens: int
+) -> int | None:
+    """Smallest ``cut`` in ``[lo, hi]`` such that ``inp[cut:]`` is at most ``max_tokens`` tokens."""
+    if lo > hi or not inp:
+        return None
+    L, R = lo, hi
+    ans: int | None = None
+    while L <= R:
+        mid = (L + R) // 2
+        if _icl_token_len(tokenizer, inp[mid:]) <= max_tokens:
+            ans = mid
+            R = mid - 1
+        else:
+            L = mid + 1
+    return ans
+
+
+def _tooluse_m2_behavior_tail_anchor(inp: str) -> int | None:
     """
-    M2 encoder for **SD-tooluse** / **SD-science**: use the dataset ``input`` verbatim when
-    its token length is ``<= max_tokens``; otherwise **right-truncate** (keep the **prefix**,
-    i.e. first ``max_tokens`` tokens — drop the tail, not the head).
+    Character index in ``inp`` where the **trailing** instruction block begins.
+
+    Prefers ``Use the following format:`` (ReAct-style), then ``Begin!``, then ``Question:``,
+    else the last line-start ``Format:``.
     """
-    inp = (inp or "").replace("\r\n", "\n").strip()
+    low = inp.lower()
+    for needle in ("\nuse the following format:", "\nbegin!\n", "\nbegin!", "\nquestion:"):
+        j = low.rfind(needle)
+        if j != -1:
+            return j
+    j2 = low.rfind("\nformat:")
+    if j2 != -1:
+        return j2
+    return None
+
+
+def sd_m2_icl_encoder_from_raw_input(
+    inp: str,
+    tokenizer,
+    max_tokens: int,
+    *,
+    task: str,
+) -> str:
+    """
+    M2 encoder for **SD-tooluse** / **SD-science** on the dataset ``input``.
+
+    - Newlines: only ``\\r\\n`` / ``\\r`` → ``\\n``; other whitespace/newlines are kept.
+    - If token length ``<= max_tokens``, returns that text unchanged.
+    - **SD-tooluse** when over budget: drop from the **start** only, keeping a suffix that
+      includes the block from the format / ``Begin!`` / ``Question:`` anchor when found.
+      If that tail alone exceeds ``max_tokens``, keep the last ``max_tokens`` tokens of the
+      tail (may alter newlines only via tokenizer decode).
+    - **SD-science** when over budget: same left-drop until the suffix fits.
+    """
+    inp = _normalize_sd_input_newlines(inp if isinstance(inp, str) else str(inp))
     if not inp:
         return ""
-    ids = tokenizer(inp, add_special_tokens=False, verbose=False)["input_ids"]
-    if len(ids) <= max_tokens:
+    if _icl_token_len(tokenizer, inp) <= max_tokens:
         return inp
-    return tokenizer.decode(ids[:max_tokens], skip_special_tokens=True)
+
+    if task == "SD-tooluse":
+        anchor = _tooluse_m2_behavior_tail_anchor(inp)
+        if anchor is None:
+            c = _icl_min_cut_drop_left(tokenizer, inp, 0, len(inp), max_tokens)
+            if c is None:
+                ids = tokenizer(inp, add_special_tokens=False, verbose=False)["input_ids"]
+                return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True)
+            return inp[c:]
+        c = _icl_min_cut_drop_left(tokenizer, inp, 0, anchor, max_tokens)
+        if c is not None:
+            return inp[c:]
+        c2 = _icl_min_cut_drop_left(tokenizer, inp, anchor, len(inp), max_tokens)
+        if c2 is not None:
+            return inp[c2:]
+        tail = inp[anchor:]
+        tids = tokenizer(tail, add_special_tokens=False, verbose=False)["input_ids"]
+        return tokenizer.decode(tids[-max_tokens:], skip_special_tokens=True)
+
+    c = _icl_min_cut_drop_left(tokenizer, inp, 0, len(inp), max_tokens)
+    if c is not None:
+        return inp[c:]
+    ids = tokenizer(inp, add_special_tokens=False, verbose=False)["input_ids"]
+    return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True)
 
 
 def sd_ttt_inner_stream_text(
@@ -171,7 +250,7 @@ def _row_tooluse(
     chunk_chars: int,
 ) -> dict[str, Any]:
     rid = f"tu_{idx}"
-    inp = (ex.get("prompt") or "").strip()
+    inp = _normalize_sd_input_newlines(ex.get("prompt") or "")
     gold = ex["golden_answer"]
     out = json.dumps(gold, ensure_ascii=False)
     rag_q = (ex.get("instruction") or "").strip()

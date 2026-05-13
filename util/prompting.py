@@ -70,9 +70,10 @@ def build_icl_source(
     Model 2 (ICL): long-context encoder text from ``input`` + ``profile``.
 
     **LaMP-5 / LaMP-7:** history chunks (profile) then the instance tail.
-    **SD-tooluse / SD-science:** use ``input`` unchanged when its token length is within
-    ``max_tokens``; otherwise keep the **prefix** (first ``max_tokens`` tokens), i.e.
-    right-truncate the text (do not drop the beginning).
+    **SD-tooluse / SD-science:** use ``input`` unchanged (only ``\\r``/``\\r\\n`` → ``\\n``)
+    when it fits ``max_tokens``; otherwise drop from the **start** of the string. **Tool-use**
+    keeps the suffix from ``Use the following format:`` / ``Begin!`` / ``Question:`` / line
+    ``Format:`` when present so instructions and the question survive truncation.
     """
     prof = sample.get("profile") or []
     if task == "LaMP-5":
@@ -83,8 +84,9 @@ def build_icl_source(
     elif task == "LaMP-7":
         hist_chunks = [f'History tweet: "{p.get("text", "")}"' for p in prof]
     elif task in ("SD-tooluse", "SD-science"):
-        inp = (sample.get("input") or "").replace("\r\n", "\n").strip()
-        return sd_self_distill.sd_m2_icl_encoder_from_raw_input(inp, tokenizer, max_tokens)
+        return sd_self_distill.sd_m2_icl_encoder_from_raw_input(
+            sample.get("input") or "", tokenizer, max_tokens, task=task
+        )
     else:
         raise ValueError(task)
 
