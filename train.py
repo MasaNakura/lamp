@@ -1,7 +1,7 @@
 """
 Global supervised training: LoRA on encoder text built from input + profile (optional adapter for **M2** / **M3** in ``run_evaluate.py``).
 
-Use ``--prompt_style icl`` to match **M2** (serialize profile + task; no retrieval). Use ``--prompt_style rag`` (default) for **M3**-style prompts (retrieve top‑K from the profile, then format). M3 can also be evaluated without this stage (base model + RAG).
+Use ``--prompt_style icl`` to match **M2** (``util.prompting.icl_m2_encoder_text``; same cap and packing as ``run_evaluate.py`` M2). Use ``--prompt_style rag`` (default) for **M3**-style prompts (retrieve top‑K from the profile, then format). M3 can also be evaluated without this stage (base model + RAG).
 
 **Training data** follows the LaMP release layout: ``train_questions.json`` (``input`` +
 ``profile`` per ``id``) and ``train_outputs.json`` (gold ``output`` per ``id``), merged
@@ -11,6 +11,12 @@ per-epoch validation; if omitted, training runs without a dev split (no
 ``load_best_model_at_end``).
 
 Uses ``GeneralSeq2SeqDataset`` and metrics from the LaMP submodule via ``util.lamp_paths``.
+
+With ``--save_encoder_prompts``, after the **last training step** of the final epoch (before any
+``load_best_model_at_end`` reload), writes ``encoder_prompts_train_m2.json`` (``--prompt_style icl``)
+or ``encoder_prompts_train_m3.json`` (``--prompt_style rag``): same schema as
+``run_evaluate.py`` ``--save_encoder_prompts``, plus ``gold_output``, with ``prediction`` filled
+from a batched ``generate`` pass on the trained model.
 """
 from __future__ import annotations
 
@@ -30,17 +36,18 @@ from util.lamp_paths import ensure_lamp_on_path
 ensure_lamp_on_path()
 
 from data.datasets import GeneralSeq2SeqDataset, convert_to_hf_dataset, create_preprocessor  # noqa: E402
-from prompts.prompts import create_prompt_generator  # noqa: E402
 from transformers import (  # noqa: E402
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
 )
 
 from util import modeling_lora
 from util import prompting as lamp_prompting
+from util.encoder_prompt_dump import encoder_source_for_seq2seq_mode, write_encoder_prompts_json
 from util.metrics_eval import build_compute_metrics
 
 _DATA_DIR = os.path.join(_ROOT, "data")
@@ -78,7 +85,12 @@ def parse_args():
     )
     p.add_argument("--base_model", default="google/flan-t5-small")
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--cache_dir", default=None)
+    p.add_argument(
+        "--cache_dir",
+        default=None,
+        help="Hugging Face hub cache directory (tokenizer, seq2seq weights, Contriever when using --retriever contriever; "
+        "also HF ``datasets`` cache where used).",
+    )
     p.add_argument("--num_retrieved", type=int, default=3)
     p.add_argument(
         "--retriever",
@@ -90,9 +102,9 @@ def parse_args():
         "--prompt_style",
         choices=["rag", "icl"],
         default="rag",
-        help="How to build encoder inputs from input+profile. **icl** = no retrieval, same packing as eval M2 "
-        "(``util.prompting.build_icl_source``; SD-tooluse / SD-science / LaMP-5 / LaMP-7). **rag** = default: "
-        "SD uses top‑K retrieval in the prompt; LaMP uses ``create_prompt_generator``. "
+        help="How to build encoder inputs from input+profile. **icl** = no retrieval, same text as eval M2 "
+        "(``util.prompting.icl_m2_encoder_text``; SD-tooluse / SD-science / LaMP-5 / LaMP-7). **rag** = default: "
+        "RAG path uses ``util.prompting.m3_rag_prompt_and_contriever`` (same as eval **M3**). "
         "``--retriever`` / ``--num_retrieved`` apply only to **rag**.",
     )
     p.add_argument("--max_input_length", type=int, default=512)
@@ -118,6 +130,20 @@ def parse_args():
     p.add_argument("--lora_r", type=int, default=8)
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--save_encoder_prompts",
+        action="store_true",
+        help="After the last training step (end of final epoch, before load_best_model_at_end reload), write "
+        "encoder_prompts_train_m2.json (icl) or encoder_prompts_train_m3.json (rag): same fields as "
+        "run_evaluate --save_encoder_prompts, plus gold_output; prediction = model generate on each row.",
+    )
+    p.add_argument(
+        "--save_encoder_prompts_max_rows",
+        type=int,
+        default=2000,
+        help="With --save_encoder_prompts, max train rows in the dump (-1 = all). First rows in merged train order; "
+        "written once at the last training step.",
+    )
     return p.parse_args()
 
 
@@ -163,6 +189,28 @@ def _write_merged_train_and_maybe_dev(
     return merged_train, None
 
 
+class LastTrainingStepEncoderDumpCallback(TrainerCallback):
+    """Run a one-shot dump on the last optimizer step (end of final epoch, pre best-model reload)."""
+
+    def __init__(self, dump_fn):
+        self.dump_fn = dump_fn
+        self.ran = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.ran:
+            return control
+        ms = int(getattr(state, "max_steps", 0) or 0)
+        if ms <= 0:
+            return control
+        if int(state.global_step) < ms:
+            return control
+        self.ran = True
+        model = kwargs.get("model")
+        if model is not None:
+            self.dump_fn(model)
+        return control
+
+
 def main():
     args = parse_args()
     if args.fp16 and args.bf16:
@@ -201,40 +249,114 @@ def main():
 
         def prompt_generator(input_text, profile, task_inner):
             row = {"input": input_text, "profile": profile or []}
-            return lamp_prompting.build_icl_source(
+            return lamp_prompting.icl_m2_encoder_text(
                 row,
                 tokenizer,
                 task=args.task,
-                max_tokens=args.max_input_length,
-                reserve_for_input=128,
+                max_input_length=args.max_input_length,
+                model=model,
+                architecture="seq2seq",
             )
 
         contriever = None
-    elif args.task in ("SD-tooluse", "SD-science"):
-        sd_rag_one = lamp_prompting.build_rag_prompt_fn(
+        rag_row_m3 = None
+    else:
+        rag_prompt_fn, contriever = lamp_prompting.m3_rag_prompt_and_contriever(
             args.task,
             tokenizer,
             num_retrieved=args.num_retrieved,
             retriever=args.retriever,
             ranked=args.ranked,
             max_length=args.max_input_length,
+            device=device,
+            cache_dir=args.cache_dir,
         )
+        rag_row_m3 = rag_prompt_fn
 
         def prompt_generator(input_text, profile, task_inner):
-            row = {"input": input_text, "profile": profile or []}
-            return sd_rag_one(row)
+            return rag_prompt_fn({"input": input_text, "profile": profile or []})
 
-        contriever = None
-    else:
-        prompt_generator, contriever = create_prompt_generator(
-            args.num_retrieved,
-            args.retriever,
-            args.ranked,
-            args.max_input_length,
-            tokenizer,
-        )
     if contriever is not None:
         contriever = contriever.to(device)
+
+    encoder_dump_cb: LastTrainingStepEncoderDumpCallback | None = None
+    if args.save_encoder_prompts:
+
+        def dump_once_train_encoder(model) -> None:
+            from run_evaluate import batched_generate
+
+            mode = "m2" if args.prompt_style == "icl" else "m3"
+            lim = args.save_encoder_prompts_max_rows
+            with open(train_path, encoding="utf-8") as f:
+                train_rows_full: list = json.load(f)
+            if lim is not None and lim >= 0:
+                train_rows_dump = train_rows_full[:lim]
+            else:
+                train_rows_dump = train_rows_full
+
+            encode_max_len = args.max_input_length
+            if mode == "m2":
+                encode_max_len = lamp_prompting.icl_m2_max_encoder_tokens(
+                    args.task, tokenizer, args.max_input_length, model=model, architecture="seq2seq"
+                )
+
+            def _rag_for_dump(row: dict) -> str:
+                return rag_row_m3(row) if rag_row_m3 is not None else ""
+
+            model.eval()
+            sources: list[str] = []
+            for row in train_rows_dump:
+                sources.append(
+                    encoder_source_for_seq2seq_mode(
+                        mode,
+                        row,
+                        task=args.task,
+                        tokenizer=tokenizer,
+                        max_in=args.max_input_length,
+                        rag_prompt=_rag_for_dump,
+                        model=model,
+                        architecture="seq2seq",
+                    )
+                )
+
+            pred_texts: list[str] = []
+            bs = max(1, args.batch_size)
+            for i in range(0, len(sources), bs):
+                chunk = sources[i : i + bs]
+                pred_texts.extend(
+                    batched_generate(
+                        model,
+                        tokenizer,
+                        chunk,
+                        device,
+                        args.max_input_length,
+                        args.max_target_length,
+                    )
+                )
+
+            preds = [(str(train_rows_dump[j]["id"]), pred_texts[j]) for j in range(len(train_rows_dump))]
+            out_ep = os.path.join(args.output_dir, f"encoder_prompts_train_{mode}.json")
+            write_encoder_prompts_json(
+                out_ep,
+                mode=mode,
+                task=args.task,
+                rows=train_rows_dump,
+                preds=preds,
+                tokenizer=tokenizer,
+                max_in=args.max_input_length,
+                encode_max_len=encode_max_len,
+                rag_prompt=_rag_for_dump,
+                model=model,
+                architecture="seq2seq",
+                include_gold_output=True,
+            )
+            print(
+                f"[train] Wrote encoder prompts + predictions (final training step): {out_ep} "
+                f"({len(train_rows_dump)} rows)",
+                file=sys.stderr,
+            )
+
+        encoder_dump_cb = LastTrainingStepEncoderDumpCallback(dump_once_train_encoder)
 
     train_ds = GeneralSeq2SeqDataset(
         train_path, use_profile=True, task=args.task, create_prompt=prompt_generator
@@ -300,7 +422,11 @@ def main():
         data_collator=collator,
         compute_metrics=(compute_metrics if not is_sd else None),
     )
+    if encoder_dump_cb is not None:
+        trainer.add_callback(encoder_dump_cb)
     trainer.train()
+    if args.save_encoder_prompts and encoder_dump_cb is not None and not encoder_dump_cb.ran:
+        dump_once_train_encoder(trainer.model)
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 

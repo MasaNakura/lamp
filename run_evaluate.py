@@ -48,8 +48,6 @@ from util.lamp_paths import ensure_lamp_on_path
 
 ensure_lamp_on_path()
 
-from prompts.prompts import create_prompt_generator  # noqa: E402
-
 _DATA_DIR = os.path.join(_ROOT, "data")
 if _DATA_DIR not in sys.path:
     sys.path.append(_DATA_DIR)
@@ -57,6 +55,7 @@ import data_io  # noqa: E402
 
 from util import metrics_eval, prompting, sd_eval_metrics  # noqa: E402
 from util import sd_self_distill  # noqa: E402
+from util.encoder_prompt_dump import encoder_source_for_seq2seq_mode, write_encoder_prompts_json  # noqa: E402
 
 
 def _is_sd_task(task: str) -> bool:
@@ -71,34 +70,6 @@ def _apply_sd_truncation_side(tok) -> None:
     """
     if hasattr(tok, "truncation_side"):
         tok.truncation_side = "left"
-
-
-def _sd_m2_encoder_max_length(
-    tokenizer,
-    cli_max: int,
-    *,
-    model=None,
-    hard_cap: int = 8192,
-) -> int:
-    """
-    Self-distillation M2 (ICL): use the largest encoder budget implied by the CLI cap,
-    a finite ``tokenizer.model_max_length``, and (when ``model`` is set) common seq2seq
-    config fields — capped for safety. When the hub uses a huge tokenizer sentinel, rely
-    on ``--max_input_length`` or the model config.
-    """
-    candidates: list[int] = [cli_max]
-    mml = getattr(tokenizer, "model_max_length", None)
-    if isinstance(mml, int) and 128 <= mml < 1_000_000:
-        candidates.append(mml)
-    if model is not None:
-        inner = model.get_base_model() if hasattr(model, "get_base_model") else model
-        cfg = getattr(inner, "config", None)
-        if cfg is not None:
-            for name in ("max_source_positions", "n_positions", "max_position_embeddings"):
-                v = getattr(cfg, name, None)
-                if isinstance(v, int) and v > 0:
-                    candidates.append(v)
-    return min(hard_cap, max(candidates))
 
 
 def _m4_rag_query(row: dict, task: str) -> str:
@@ -148,7 +119,12 @@ def parse_args():
         default="m1,m2,m3,m4",
         help="Comma list among m1,m2,m3,m4 (m4 = TTT-E2E-style inner: Flan ``flan_inner`` or GPT-2 ``mam_inner``; base model).",
     )
-    p.add_argument("--cache_dir", default=None)
+    p.add_argument(
+        "--cache_dir",
+        default=None,
+        help="Hugging Face hub cache directory (tokenizer, seq2seq weights, Contriever when using --retriever contriever; "
+        "also HF ``datasets`` cache where used).",
+    )
     p.add_argument("--num_retrieved", type=int, default=3)
     p.add_argument(
         "--retriever",
@@ -243,7 +219,8 @@ def parse_args():
         "--save_encoder_prompts",
         action="store_true",
         help="After each mode, write encoder_prompts_<mode>.json: per-row id, raw task input, full encoder "
-        "string passed to generate (M1/M2/M3/M4), approximate token length, and prediction.",
+        "string passed to generate (M1/M2/M3/M4), approximate token length, and prediction. Same schema as "
+        "``train.py --save_encoder_prompts`` (training dump adds ``gold_output``).",
     )
     return p.parse_args()
 
@@ -259,84 +236,6 @@ def _clip_text(s: str, max_chars: int) -> str:
     return t[: max_chars - 3] + "..."
 
 
-def _encoder_source_for_mode(
-    mode: str,
-    row: dict,
-    *,
-    task: str,
-    tokenizer,
-    max_in: int,
-    rag_prompt: Callable[[dict], str],
-    model=None,
-) -> str:
-    """Same text the model sees (pre-tokenization) as in ``run_for_mode``."""
-    if mode in ("m1", "m4"):
-        return row["input"]
-    if mode == "m2":
-        m2_tok = max_in
-        if _is_sd_task(task):
-            m2_tok = _sd_m2_encoder_max_length(tokenizer, max_in, model=model)
-        return prompting.build_icl_source(
-            row, tokenizer, task=task, max_tokens=m2_tok, reserve_for_input=128
-        )
-    return rag_prompt(row)
-
-
-def _write_encoder_prompts_json(
-    path: str,
-    *,
-    mode: str,
-    task: str,
-    rows: list[dict],
-    preds: list[tuple[Any, str]],
-    tokenizer,
-    max_in: int,
-    encode_max_len: int,
-    rag_prompt: Callable[[dict], str],
-    model,
-    architecture: str,
-) -> None:
-    """Full encoder string per test row (what ``batched_generate`` / causal path consumes for that mode)."""
-    pred_map = dict(preds)
-    lm = model if architecture == "seq2seq" else None
-    recs: list[dict] = []
-    for row in rows:
-        rid = row["id"]
-        enc = _encoder_source_for_mode(
-            mode,
-            row,
-            task=task,
-            tokenizer=tokenizer,
-            max_in=max_in,
-            rag_prompt=rag_prompt,
-            model=lm,
-        )
-        ntok = len(
-            tokenizer.encode(
-                enc,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=131072,
-            )
-        )
-        recs.append(
-            {
-                "id": rid,
-                "mode": mode,
-                "task": task,
-                "raw_task_input": row.get("input", ""),
-                "encoder_prompt": enc,
-                "approx_encoder_tokens_trunc": ntok,
-                "seq2seq_encode_max_length": encode_max_len,
-                "prediction": pred_map.get(rid, ""),
-            }
-        )
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(recs, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-
 def _verbose_report_mode(
     mode: str,
     *,
@@ -350,6 +249,8 @@ def _verbose_report_mode(
     pred_map: dict,
     corpus_metrics: dict[str, float],
     max_samples: int,
+    architecture: str = "seq2seq",
+    icl_model=None,
 ) -> None:
     n = len(id_order)
     limit = n if max_samples < 0 else min(n, max_samples)
@@ -374,8 +275,15 @@ def _verbose_report_mode(
         ref = refs[i]
         pred = pred_map[rid]
         prof = row.get("profile") or []
-        enc_src = _encoder_source_for_mode(
-            mode, row, task=task, tokenizer=tokenizer, max_in=max_in, rag_prompt=rag_prompt
+        enc_src = encoder_source_for_seq2seq_mode(
+            mode,
+            row,
+            task=task,
+            tokenizer=tokenizer,
+            max_in=max_in,
+            rag_prompt=rag_prompt,
+            model=icl_model,
+            architecture=architecture,
         )
         if _is_sd_task(task):
             if task == "SD-tooluse":
@@ -733,17 +641,15 @@ def run_for_mode(
     preds: list[tuple[str, str]] = []
 
     encode_max_len = max_in
-    if (
-        mode == "m2"
-        and _is_sd_task(task)
-        and architecture == "seq2seq"
-    ):
-        encode_max_len = _sd_m2_encoder_max_length(tokenizer, max_in, model=model)
+    if mode == "m2" and architecture == "seq2seq":
+        encode_max_len = prompting.icl_m2_max_encoder_tokens(
+            task, tokenizer, max_in, model=model, architecture=architecture
+        )
 
     def _maybe_dump_encoder_prompts() -> None:
         if not encoder_prompts_path:
             return
-        _write_encoder_prompts_json(
+        write_encoder_prompts_json(
             encoder_prompts_path,
             mode=mode,
             task=task,
@@ -784,12 +690,13 @@ def run_for_mode(
             if mode == "m1":
                 src = row["input"]
             elif mode == "m2":
-                src = prompting.build_icl_source(
+                src = prompting.icl_m2_encoder_text(
                     row,
                     tokenizer,
                     task=task,
-                    max_tokens=encode_max_len,
-                    reserve_for_input=128,
+                    max_input_length=max_in,
+                    model=model,
+                    architecture=architecture,
                 )
             else:
                 src = rag_prompt(row)
@@ -1018,30 +925,18 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     if _is_sd_task(args.task):
         _apply_sd_truncation_side(tokenizer)
-    rag_gen, contriever = create_prompt_generator(
-        args.num_retrieved,
-        args.retriever,
-        args.ranked,
-        args.max_input_length,
+    rag_prompt, contriever = prompting.m3_rag_prompt_and_contriever(
+        args.task,
         tokenizer,
+        num_retrieved=args.num_retrieved,
+        retriever=args.retriever,
+        ranked=args.ranked,
+        max_length=args.max_input_length,
+        device=device,
+        cache_dir=args.cache_dir,
     )
     if contriever is not None:
         contriever = contriever.to(device)
-
-    def rag_prompt(row: dict) -> str:
-        if _is_sd_task(args.task):
-            return sd_self_distill.build_sd_rag_prompt(
-                row,
-                task=args.task,
-                num_retrieved=args.num_retrieved,
-                retriever=args.retriever,
-                ranked=args.ranked,
-                max_length=args.max_input_length,
-                tokenizer=tokenizer,
-                device=device,
-                cache_dir=args.cache_dir,
-            )
-        return rag_gen(row["input"], row["profile"], args.task)
 
     results_summary: dict[str, dict] = {}
     for mode in modes:
@@ -1141,6 +1036,8 @@ def main():
                 pred_map=pred_map,
                 corpus_metrics=metrics,
                 max_samples=args.verbose_max_samples,
+                architecture=arch,
+                icl_model=None,
             )
 
     with open(os.path.join(args.output_dir, "summary.json"), "w", encoding="utf-8") as f:

@@ -66,23 +66,11 @@ def meta_example_stream(
 
 
 def _lamp_profile_document(task: str, profile: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    if task == "LaMP-5":
-        for p in profile:
-            t = (p.get("title") or "").strip()
-            a = (p.get("abstract") or "").strip()
-            if t:
-                parts.append(f"[title] {t}")
-            if a:
-                parts.append(f"[abstract] {a}")
-    elif task == "LaMP-7":
-        for p in profile:
-            tx = (p.get("text") or "").strip()
-            if tx:
-                parts.append(f"[tweet] {tx}")
-    else:
-        raise ValueError(task)
-    return "\n\n".join(parts)
+    """Same flattened profile text as eval Flan M4 / ``build_flat_history_stream``."""
+    from ttt.e2e import build_flat_history_stream
+
+    prof = profile if isinstance(profile, list) else []
+    return build_flat_history_stream(task, prof)
 
 
 def _lamp_train_token_cache(
@@ -108,7 +96,12 @@ def _lamp_train_token_cache(
     buf: list[int] = []
     for row in rows:
         if task in ("SD-tooluse", "SD-science"):
-            doc = (row.get("input") or "").strip()
+            prof = row.get("profile") or []
+            if not isinstance(prof, list):
+                prof = []
+            from util.sd_self_distill import sd_ttt_inner_stream_text
+
+            doc = sd_ttt_inner_stream_text([row], prof)
         else:
             prof = row.get("profile") or []
             doc = _lamp_profile_document(task, prof if isinstance(prof, list) else [])
@@ -171,9 +164,8 @@ def meta_example_stream_lamp_rag(
     **single train row** after LaMP-style RAG narrows that row's profile. Aligns meta-training
     with query-conditioned TTT at test time.
     """
-    from .e2e import build_flat_history_stream
-
-    from util.sd_self_distill import sd_ttt_inner_stream_text
+    from ttt.e2e import build_flat_history_stream
+    from util.sd_self_distill import sd_rag_query_for_row, sd_ttt_inner_stream_text
 
     valid = [r for r in train_rows if (r.get("profile") or []) and (r.get("input") or "").strip()]
     if not valid:
@@ -190,7 +182,7 @@ def meta_example_stream_lamp_rag(
                 "--ttt_rag_num_retrieved."
             )
         row = rng.choice(valid)
-        inp = (row.get("sd_rag_query") or "").strip() or (row.get("input") or "").strip()
+        inp = sd_rag_query_for_row(row)
         prof = row.get("profile") or []
         subset = rag.select(inp, prof)
         use_prof = subset if subset else prof

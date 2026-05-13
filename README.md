@@ -17,7 +17,7 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 
 | Path | Role |
 |------|------|
-| `train.py` | Optional supervised LoRA: **`--prompt_style icl`** (no retrieval; matches eval **M2**) or **`rag`** (default; retrieval-style for **M3** on SD, or LaMP’s generator). |
+| `train.py` | Optional supervised LoRA: **`--prompt_style icl`** (eval **M2**) or **`rag`** (**M3**). **`--save_encoder_prompts`** writes `encoder_prompts_train_m2.json` / `encoder_prompts_train_m3.json` **once at the last training step** (end of final epoch, before best-checkpoint reload), with model **predictions** + `gold_output`. |
 | `run_evaluate.py` | **M1/M2/M3/M4** inference and metrics. |
 | `requirements.txt` | Python dependencies (includes **`higher`** for TTT-E2E meta-training). |
 | `data/` | Merge questions/outputs and infer user keys (`data_io.py`). |
@@ -313,9 +313,9 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--m4_profile_max_tokens` | **M4:** hard cap (first *N* tokens) on the merged **profile** before inner TTT. Unset: **SD-tooluse / SD-science** = **no cap** (full profile, sliding windows only); **LaMP** = `min(4096, 8 × max_input_length)`. Set explicitly to limit VRAM/time on very long profiles. |
 | `--m4_use_rag` | **M4:** retrieve top‑K history per test row (M3 retriever flags), inner TTT on retrieved text, then generate. Omit for full-profile TTT once per user. |
 | `--user_field` | JSON field for user id when grouping test rows (**M4**). |
-| `--cache_dir` | Hugging Face cache directory. |
+| `--cache_dir` | Hugging Face **hub** cache (downloads for tokenizer, seq2seq base, and **Contriever** when `--retriever contriever` on M3/M4+RAG). Also passed where HF ``datasets`` uses a cache. Point this at a fast disk or shared location to avoid re-downloading. |
 | `--max_users` | If set to `K` (>0), only rows belonging to the **first K distinct users** (in merged test file order) are evaluated—handy for debugging without the full split. |
 | `--verbose`, `--verbose_max_samples` | Print per-example inputs, profile counts, encoder preview, preds vs gold, and per-row BLEU/ROUGE/METEOR (cap rows with `verbose_max_samples`, `-1` = all). |
-| `--save_encoder_prompts` | After each mode, write `encoder_prompts_<mode>.json`: per-test `id`, raw `input`, full **encoder string** passed to `generate` for that mode (M1/M2/M3/M4), approximate token count, and prediction. |
+| `--save_encoder_prompts` | After each mode, write `encoder_prompts_<mode>.json`: per-test `id`, raw `input`, full **encoder string** passed to `generate` for that mode (M1/M2/M3/M4), approximate token count, and prediction. Same schema as ``train.py --save_encoder_prompts`` (train adds ``gold_output``). |
 
 LaMP data and papers: `LaMP/README.md` (inside your clone) and [lamp-benchmark.github.io](https://lamp-benchmark.github.io/).
