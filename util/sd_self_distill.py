@@ -128,22 +128,54 @@ def _icl_min_cut_drop_left(
     return ans
 
 
-def _tooluse_m2_behavior_tail_anchor(inp: str) -> int | None:
+def _split_sd_tooluse_at_format(inp: str) -> tuple[str, str]:
     """
-    Character index in ``inp`` where the **trailing** instruction block begins.
+    Split at the **last** case-insensitive ``Format:`` so API ``- Format:`` lines earlier
+    in the doc still leave the final ``…format:`` (e.g. in ``Use the following format:``)
+    as the start of the fixed **second** segment.
+    """
+    matches = list(re.finditer(r"(?i)format:", inp))
+    if not matches:
+        return inp, ""
+    idx = matches[-1].start()
+    return inp[:idx], inp[idx:]
 
-    Prefers ``Use the following format:`` (ReAct-style), then ``Begin!``, then ``Question:``,
-    else the last line-start ``Format:``.
+
+def _sd_tooluse_m2_encoder_format_split(
+    tokenizer, part1: str, part2: str, max_tokens: int
+) -> str:
     """
-    low = inp.lower()
-    for needle in ("\nuse the following format:", "\nbegin!\n", "\nbegin!", "\nquestion:"):
-        j = low.rfind(needle)
-        if j != -1:
-            return j
-    j2 = low.rfind("\nformat:")
-    if j2 != -1:
-        return j2
-    return None
+    Second segment (from ``Format:`` onward) is kept as a raw substring. The first segment
+    is shortened from the **right** in token space (beginning of part1 preserved) so the
+    concatenation fits ``max_tokens`` when measured on ``truncated_first + second`` together.
+    """
+    if not part2:
+        ids = tokenizer(part1, add_special_tokens=False, verbose=False)["input_ids"]
+        if len(ids) <= max_tokens:
+            return part1
+        return tokenizer.decode(ids[:max_tokens], skip_special_tokens=True)
+
+    t2 = _icl_token_len(tokenizer, part2)
+    if t2 > max_tokens:
+        p2_ids = tokenizer(part2, add_special_tokens=False, verbose=False)["input_ids"]
+        return tokenizer.decode(p2_ids[-max_tokens:], skip_special_tokens=True)
+
+    budget1 = max_tokens - t2
+    p1_ids = tokenizer(part1, add_special_tokens=False, verbose=False)["input_ids"]
+    if len(p1_ids) <= budget1:
+        return part1 + part2
+
+    L, R = 0, len(p1_ids)
+    ans = 0
+    while L <= R:
+        mid = (L + R) // 2
+        left = tokenizer.decode(p1_ids[:mid], skip_special_tokens=True)
+        if _icl_token_len(tokenizer, left + part2) <= max_tokens:
+            ans = mid
+            L = mid + 1
+        else:
+            R = mid - 1
+    return tokenizer.decode(p1_ids[:ans], skip_special_tokens=True) + part2
 
 
 def sd_m2_icl_encoder_from_raw_input(
@@ -158,11 +190,12 @@ def sd_m2_icl_encoder_from_raw_input(
 
     - Newlines: only ``\\r\\n`` / ``\\r`` → ``\\n``; other whitespace/newlines are kept.
     - If token length ``<= max_tokens``, returns that text unchanged.
-    - **SD-tooluse** when over budget: drop from the **start** only, keeping a suffix that
-      includes the block from the format / ``Begin!`` / ``Question:`` anchor when found.
-      If that tail alone exceeds ``max_tokens``, keep the last ``max_tokens`` tokens of the
-      tail (may alter newlines only via tokenizer decode).
-    - **SD-science** when over budget: same left-drop until the suffix fits.
+    - **SD-tooluse** when over budget: split at the last case-insensitive ``Format:``;
+      the **second** segment (from that ``Format:`` through the end) is kept verbatim unless
+      it alone exceeds ``max_tokens`` (then only its last ``max_tokens`` tokens are kept).
+      The **first** segment is shortened from the **right** in token space so
+      ``tokenize(truncated_first + second) <= max_tokens``.
+    - **SD-science** when over budget: drop from the **start** until the suffix fits.
     """
     inp = _normalize_sd_input_newlines(inp if isinstance(inp, str) else str(inp))
     if not inp:
@@ -171,22 +204,8 @@ def sd_m2_icl_encoder_from_raw_input(
         return inp
 
     if task == "SD-tooluse":
-        anchor = _tooluse_m2_behavior_tail_anchor(inp)
-        if anchor is None:
-            c = _icl_min_cut_drop_left(tokenizer, inp, 0, len(inp), max_tokens)
-            if c is None:
-                ids = tokenizer(inp, add_special_tokens=False, verbose=False)["input_ids"]
-                return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True)
-            return inp[c:]
-        c = _icl_min_cut_drop_left(tokenizer, inp, 0, anchor, max_tokens)
-        if c is not None:
-            return inp[c:]
-        c2 = _icl_min_cut_drop_left(tokenizer, inp, anchor, len(inp), max_tokens)
-        if c2 is not None:
-            return inp[c2:]
-        tail = inp[anchor:]
-        tids = tokenizer(tail, add_special_tokens=False, verbose=False)["input_ids"]
-        return tokenizer.decode(tids[-max_tokens:], skip_special_tokens=True)
+        p1, p2 = _split_sd_tooluse_at_format(inp)
+        return _sd_tooluse_m2_encoder_format_split(tokenizer, p1, p2, max_tokens)
 
     c = _icl_min_cut_drop_left(tokenizer, inp, 0, len(inp), max_tokens)
     if c is not None:
