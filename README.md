@@ -174,7 +174,7 @@ python3 run_evaluate.py --task LaMP-5 \
 
 ### M2 — ICL
 
-Long-context ICL. **LaMP:** serialized profile + instance. **SD:** full ``input`` when it fits ``--max_input_length`` (only ``\\r``/``\\r\\n`` → ``\\n``). **Tool-use** over budget: split at the last ``Format:``; keep everything from that ``Format:`` onward; shorten only the left part from the **right** (start of prompt kept) so the joined text fits in tokens. **Science:** truncate from the start of the prompt. Add **`--adapter_dir`** for LoRA; train SD with **`--prompt_style icl`** to match.
+Long-context ICL. **LaMP:** serialized profile + instance. **SD:** full ``input`` when it fits ``--max_input_length`` (only ``\\r``/``\\r\\n`` → ``\\n``). **Tool-use** over budget: split at ``\\n\\nUse the following format:\\n``; keep everything from that marker onward; shorten only the left part from the **right** (start of prompt kept) so the joined text fits in tokens. **Science:** truncate from the start of the prompt. Add **`--adapter_dir`** for LoRA; train SD with **`--prompt_style icl`** to match.
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \

@@ -128,26 +128,35 @@ def _icl_min_cut_drop_left(
     return ans
 
 
-def _split_sd_tooluse_at_format(inp: str) -> tuple[str, str]:
+_USE_THE_FOLLOWING_FORMAT_BLOCK = "\n\nUse the following format:\n"
+
+
+def _split_sd_tooluse_at_use_format_block(inp: str) -> tuple[str, str]:
     """
-    Split at the **last** case-insensitive ``Format:`` so API ``- Format:`` lines earlier
-    in the doc still leave the final ``…format:`` (e.g. in ``Use the following format:``)
-    as the start of the fixed **second** segment.
+    Split into (before, from_marker_onward). Marker is ``\\n\\nUse the following format:\\n``
+    (exact); if missing, a case-insensitive match with flexible interior whitespace is tried.
     """
-    matches = list(re.finditer(r"(?i)format:", inp))
-    if not matches:
-        return inp, ""
-    idx = matches[-1].start()
-    return inp[:idx], inp[idx:]
+    needle = _USE_THE_FOLLOWING_FORMAT_BLOCK
+    idx = inp.find(needle)
+    if idx != -1:
+        return inp[:idx], inp[idx:]
+    m = re.search(r"(?i)\n\n\s*use the following format:\s*\n", inp)
+    if m is not None:
+        return inp[: m.start()], inp[m.start() :]
+    m2 = re.search(r"(?i)\n\n\s*use the following format:", inp)
+    if m2 is not None:
+        return inp[: m2.start()], inp[m2.start() :]
+    return inp, ""
 
 
 def _sd_tooluse_m2_encoder_format_split(
     tokenizer, part1: str, part2: str, max_tokens: int
 ) -> str:
     """
-    Second segment (from ``Format:`` onward) is kept as a raw substring. The first segment
-    is shortened from the **right** in token space (beginning of part1 preserved) so the
-    concatenation fits ``max_tokens`` when measured on ``truncated_first + second`` together.
+    Second segment (from ``\\n\\nUse the following format:\\n`` onward) is kept as a raw
+    substring. The first segment is shortened from the **right** in token space (beginning
+    of part1 preserved) so the concatenation fits ``max_tokens`` when measured on
+    ``truncated_first + second`` together.
     """
     if not part2:
         ids = tokenizer(part1, add_special_tokens=False, verbose=False)["input_ids"]
@@ -190,9 +199,9 @@ def sd_m2_icl_encoder_from_raw_input(
 
     - Newlines: only ``\\r\\n`` / ``\\r`` → ``\\n``; other whitespace/newlines are kept.
     - If token length ``<= max_tokens``, returns that text unchanged.
-    - **SD-tooluse** when over budget: split at the last case-insensitive ``Format:``;
-      the **second** segment (from that ``Format:`` through the end) is kept verbatim unless
-      it alone exceeds ``max_tokens`` (then only its last ``max_tokens`` tokens are kept).
+    - **SD-tooluse** when over budget: split at ``\\n\\nUse the following format:\\n`` (with
+      a small regex fallback if spacing differs); the **second** segment is kept verbatim
+      unless it alone exceeds ``max_tokens`` (then only its last ``max_tokens`` tokens).
       The **first** segment is shortened from the **right** in token space so
       ``tokenize(truncated_first + second) <= max_tokens``.
     - **SD-science** when over budget: drop from the **start** until the suffix fits.
@@ -204,7 +213,7 @@ def sd_m2_icl_encoder_from_raw_input(
         return inp
 
     if task == "SD-tooluse":
-        p1, p2 = _split_sd_tooluse_at_format(inp)
+        p1, p2 = _split_sd_tooluse_at_use_format_block(inp)
         return _sd_tooluse_m2_encoder_format_split(tokenizer, p1, p2, max_tokens)
 
     c = _icl_min_cut_drop_left(tokenizer, inp, 0, len(inp), max_tokens)

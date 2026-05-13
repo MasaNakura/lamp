@@ -71,9 +71,9 @@ def build_icl_source(
 
     **LaMP-5 / LaMP-7:** history chunks (profile) then the instance tail.
     **SD-tooluse / SD-science:** use ``input`` unchanged (only ``\\r``/``\\r\\n`` → ``\\n``)
-    when it fits ``max_tokens``. **Tool-use** over budget: split at the last ``Format:``;
-    keep the right segment verbatim and right-truncate the left segment in token space so
-    the joined string fits. **Science:** drop from the start until the suffix fits.
+    when it fits ``max_tokens``. **Tool-use** over budget: split at
+    ``\\n\\nUse the following format:\\n``; keep the right segment verbatim and
+    right-truncate the left segment in token space so the joined string fits. **Science:** drop from the start until the suffix fits.
     """
     prof = sample.get("profile") or []
     if task == "LaMP-5":
