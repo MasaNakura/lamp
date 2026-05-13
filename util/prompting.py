@@ -70,10 +70,9 @@ def build_icl_source(
     Model 2 (ICL): long-context encoder text from ``input`` + ``profile``.
 
     **LaMP-5 / LaMP-7:** history chunks (profile) then the instance tail.
-    **SD-tooluse:** header first (through ``Documentation:`` via ``sd_m2_preserving_tail``),
-    then the full post-header tool documentation from ``input`` (all tools in that block),
-    truncating the **middle** only when over ``max_tokens``.
-    **SD-science:** preserved prefix first, then profile lines packed under budget.
+    **SD-tooluse / SD-science:** use ``input`` unchanged when its token length is within
+    ``max_tokens``; otherwise keep the **prefix** (first ``max_tokens`` tokens), i.e.
+    right-truncate the text (do not drop the beginning).
     """
     prof = sample.get("profile") or []
     if task == "LaMP-5":
@@ -83,40 +82,11 @@ def build_icl_source(
         ]
     elif task == "LaMP-7":
         hist_chunks = [f'History tweet: "{p.get("text", "")}"' for p in prof]
-    elif task == "SD-tooluse":
-        return sd_self_distill.build_sd_m2_tooluse_icl_encoder(sample, tokenizer, max_tokens=max_tokens)
-    elif task == "SD-science":
-        hist_chunks = [(p.get("text") or "").strip() for p in prof if (p.get("text") or "").strip()]
+    elif task in ("SD-tooluse", "SD-science"):
+        inp = (sample.get("input") or "").replace("\r\n", "\n").strip()
+        return sd_self_distill.sd_m2_icl_encoder_from_raw_input(inp, tokenizer, max_tokens)
     else:
         raise ValueError(task)
-
-    if task == "SD-science":
-        tail = sd_self_distill.sd_m2_preserving_tail(sample, task=task)
-        sep = "\n\n"
-        tok = tokenizer
-        tail_ids = tok(tail, add_special_tokens=False, verbose=False)["input_ids"]
-        sep_ids = tok(sep, add_special_tokens=False, verbose=False)["input_ids"]
-        min_doc_tokens = 16
-        if len(tail_ids) + len(sep_ids) + min_doc_tokens > max_tokens:
-            keep = max(64, max_tokens - len(sep_ids) - min_doc_tokens)
-            tail = tok.decode(tail_ids[-keep:], skip_special_tokens=True)
-            tail_ids = tok(tail, add_special_tokens=False, verbose=False)["input_ids"]
-        budget = max_tokens - len(tail_ids) - len(sep_ids)
-        budget = max(0, budget)
-        text_parts: list[str] = []
-        for chunk in reversed(hist_chunks):
-            ids = tok(chunk, add_special_tokens=False, verbose=False)["input_ids"]
-            if len(ids) > budget:
-                if budget <= 0:
-                    break
-                chunk = tok.decode(ids[-budget:], skip_special_tokens=True)
-                text_parts.append(chunk)
-                break
-            text_parts.append(chunk)
-            budget -= len(ids)
-        history = "\n".join(reversed(text_parts))
-        # Read natural order: preserved system / task prefix first, then profile lines.
-        return (tail + sep + history).strip() if history.strip() else tail
 
     tail = "\n\nNow personalize for this instance:\n" + sample["input"]
     budget = max_tokens - len(

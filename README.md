@@ -174,7 +174,7 @@ python3 run_evaluate.py --task LaMP-5 \
 
 ### M2 — ICL
 
-Long-context ICL (serialized profile + task). Add **`--adapter_dir`** to load LoRA from **`train.py`**; for weights aligned with this mode, train with **`--prompt_style icl`** (encoder text is the same ICL packing as here, not the M3 RAG prompt).
+Long-context ICL. **LaMP:** serialized profile + instance. **SD-tooluse / SD-science:** full ``input`` when it fits ``--max_input_length`` in tokens; otherwise prefix only (right-truncated). Add **`--adapter_dir`** to load LoRA from **`train.py`**; for weights aligned with this mode, train SD with **`--prompt_style icl`**.
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \
