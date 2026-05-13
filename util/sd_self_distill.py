@@ -149,42 +149,82 @@ def _split_sd_tooluse_at_use_format_block(inp: str) -> tuple[str, str]:
     return inp, ""
 
 
-def _sd_tooluse_m2_encoder_format_split(
-    tokenizer, part1: str, part2: str, max_tokens: int
-) -> str:
-    """
-    Second segment (from ``\\n\\nUse the following format:\\n`` onward) is kept as a raw
-    substring. The first segment is shortened from the **right** in token space (beginning
-    of part1 preserved) so the concatenation fits ``max_tokens`` when measured on
-    ``truncated_first + second`` together.
-    """
-    if not part2:
-        ids = tokenizer(part1, add_special_tokens=False, verbose=False)["input_ids"]
-        if len(ids) <= max_tokens:
-            return part1
-        return tokenizer.decode(ids[:max_tokens], skip_special_tokens=True)
-
-    t2 = _icl_token_len(tokenizer, part2)
-    if t2 > max_tokens:
-        p2_ids = tokenizer(part2, add_special_tokens=False, verbose=False)["input_ids"]
-        return tokenizer.decode(p2_ids[-max_tokens:], skip_special_tokens=True)
-
-    budget1 = max_tokens - t2
-    p1_ids = tokenizer(part1, add_special_tokens=False, verbose=False)["input_ids"]
-    if len(p1_ids) <= budget1:
-        return part1 + part2
-
-    L, R = 0, len(p1_ids)
+def _icl_max_char_prefix_under_token_cap(tokenizer, s: str, max_tokens: int) -> str:
+    """Longest ``s[:c]`` that is an exact substring of ``s`` with ``<= max_tokens`` tokens."""
+    if not s:
+        return s
+    if _icl_token_len(tokenizer, s) <= max_tokens:
+        return s
+    L, R = 0, len(s)
     ans = 0
     while L <= R:
         mid = (L + R) // 2
-        left = tokenizer.decode(p1_ids[:mid], skip_special_tokens=True)
-        if _icl_token_len(tokenizer, left + part2) <= max_tokens:
+        if _icl_token_len(tokenizer, s[:mid]) <= max_tokens:
             ans = mid
             L = mid + 1
         else:
             R = mid - 1
-    return tokenizer.decode(p1_ids[:ans], skip_special_tokens=True) + part2
+    return s[:ans]
+
+
+def _icl_max_char_prefix_plus_suffix_under_cap(
+    tokenizer, prefix_src: str, suffix: str, max_tokens: int
+) -> str:
+    """
+    Longest ``prefix_src[:c] + suffix`` using an exact prefix slice of ``prefix_src`` so
+    newlines/spacing match the raw string (no tokenizer round-trip on the kept prefix).
+    """
+    if not suffix:
+        return _icl_max_char_prefix_under_token_cap(tokenizer, prefix_src, max_tokens)
+    L, R = 0, len(prefix_src)
+    ans = 0
+    while L <= R:
+        mid = (L + R) // 2
+        if _icl_token_len(tokenizer, prefix_src[:mid] + suffix) <= max_tokens:
+            ans = mid
+            L = mid + 1
+        else:
+            R = mid - 1
+    return prefix_src[:ans] + suffix
+
+
+def _icl_min_char_suffix_start_under_token_cap(tokenizer, s: str, max_tokens: int) -> str:
+    """Shortest prefix drop: return ``s[s0:]`` (exact tail substring) with ``<= max_tokens``."""
+    if not s:
+        return s
+    if _icl_token_len(tokenizer, s) <= max_tokens:
+        return s
+    L, R = 0, len(s)
+    ans = len(s)
+    while L <= R:
+        mid = (L + R) // 2
+        if _icl_token_len(tokenizer, s[mid:]) <= max_tokens:
+            ans = mid
+            R = mid - 1
+        else:
+            L = mid + 1
+    return s[ans:]
+
+
+def _sd_tooluse_m2_encoder_format_split(
+    tokenizer, part1: str, part2: str, max_tokens: int
+) -> str:
+    """
+    Second segment is an exact substring of the raw prompt. The first segment is shortened
+    from the **right** using an **exact character prefix** (no encode/decode of the kept
+    left text) so newlines match the raw string; only ``tokenize(prefix + part2)`` is used
+    to respect ``max_tokens``.
+    """
+    if not part2:
+        return _icl_max_char_prefix_under_token_cap(tokenizer, part1, max_tokens)
+
+    if _icl_token_len(tokenizer, part2) > max_tokens:
+        return _icl_min_char_suffix_start_under_token_cap(tokenizer, part2, max_tokens)
+
+    if _icl_token_len(tokenizer, part1 + part2) <= max_tokens:
+        return part1 + part2
+
+    return _icl_max_char_prefix_plus_suffix_under_cap(tokenizer, part1, part2, max_tokens)
 
 
 def sd_m2_icl_encoder_from_raw_input(
@@ -201,9 +241,9 @@ def sd_m2_icl_encoder_from_raw_input(
     - If token length ``<= max_tokens``, returns that text unchanged.
     - **SD-tooluse** when over budget: split at ``\\n\\nUse the following format:\\n`` (with
       a small regex fallback if spacing differs); the **second** segment is kept verbatim
-      unless it alone exceeds ``max_tokens`` (then only its last ``max_tokens`` tokens).
-      The **first** segment is shortened from the **right** in token space so
-      ``tokenize(truncated_first + second) <= max_tokens``.
+      unless it alone exceeds ``max_tokens`` (then an exact **character** suffix of part2
+      is kept so newlines stay verbatim). The **first** segment is shortened from the **right**
+      using an exact character prefix of part1 so the raw newlines are preserved.
     - **SD-science** when over budget: drop from the **start** until the suffix fits.
     """
     inp = _normalize_sd_input_newlines(inp if isinstance(inp, str) else str(inp))

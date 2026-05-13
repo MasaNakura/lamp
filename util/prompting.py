@@ -73,7 +73,8 @@ def build_icl_source(
     **SD-tooluse / SD-science:** use ``input`` unchanged (only ``\\r``/``\\r\\n`` → ``\\n``)
     when it fits ``max_tokens``. **Tool-use** over budget: split at
     ``\\n\\nUse the following format:\\n``; keep the right segment verbatim and
-    right-truncate the left segment in token space so the joined string fits. **Science:** drop from the start until the suffix fits.
+    right-truncate the left segment using an **exact character prefix** of the raw string so
+    newlines match; token counting only decides how much of that prefix to keep. **Science:** drop from the start until the suffix fits.
     """
     prof = sample.get("profile") or []
     if task == "LaMP-5":
