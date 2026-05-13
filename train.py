@@ -1,8 +1,7 @@
 """
-Global supervised training: LoRA + LaMP RAG prompts (optional checkpoint for **M3**).
+Global supervised training: LoRA on encoder text built from input + profile (optional adapter for **M2** / **M3** in ``run_evaluate.py``).
 
-The saved checkpoint can be used by `run_evaluate.py` for **M3** (RAG + adapter).
-M3 can also run without this stage (base model + RAG).
+Use ``--prompt_style icl`` to match **M2** (serialize profile + task; no retrieval). Use ``--prompt_style rag`` (default) for **M3**-style prompts (retrieve top‑K from the profile, then format). M3 can also be evaluated without this stage (base model + RAG).
 
 **Training data** follows the LaMP release layout: ``train_questions.json`` (``input`` +
 ``profile`` per ``id``) and ``train_outputs.json`` (gold ``output`` per ``id``), merged
@@ -41,6 +40,7 @@ from transformers import (  # noqa: E402
 )
 
 from util import modeling_lora
+from util import prompting as lamp_prompting
 from util.metrics_eval import build_compute_metrics
 
 _DATA_DIR = os.path.join(_ROOT, "data")
@@ -51,7 +51,11 @@ import data_io  # noqa: E402
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", choices=["LaMP-5", "LaMP-7"], required=True)
+    p.add_argument(
+        "--task",
+        choices=["LaMP-5", "LaMP-7", "SD-tooluse", "SD-science"],
+        required=True,
+    )
     p.add_argument(
         "--train_questions_json",
         required=True,
@@ -82,6 +86,15 @@ def parse_args():
         choices=["contriever", "bm25", "random", "recency"],
     )
     p.add_argument("--ranked", action="store_true", help="Profile items are pre-ranked (LaMP merge step).")
+    p.add_argument(
+        "--prompt_style",
+        choices=["rag", "icl"],
+        default="rag",
+        help="How to build encoder inputs from input+profile. **icl** = no retrieval, same packing as eval M2 "
+        "(``util.prompting.build_icl_source``; SD-tooluse / SD-science / LaMP-5 / LaMP-7). **rag** = default: "
+        "SD uses top‑K retrieval in the prompt; LaMP uses ``create_prompt_generator``. "
+        "``--retriever`` / ``--num_retrieved`` apply only to **rag**.",
+    )
     p.add_argument("--max_input_length", type=int, default=512)
     p.add_argument("--max_target_length", type=int, default=128)
     p.add_argument(
@@ -154,6 +167,10 @@ def main():
     args = parse_args()
     if args.fp16 and args.bf16:
         raise SystemExit("Use at most one of --fp16 and --bf16.")
+    if args.prompt_style == "icl" and args.task not in ("SD-tooluse", "SD-science", "LaMP-5", "LaMP-7"):
+        raise SystemExit(
+            "--prompt_style icl is only supported for SD-tooluse, SD-science, LaMP-5, and LaMP-7."
+        )
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:
@@ -167,6 +184,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, cache_dir=args.cache_dir, use_fast=False
     )
+    if args.task in ("SD-tooluse", "SD-science"):
+        if hasattr(tokenizer, "truncation_side"):
+            tokenizer.truncation_side = "left"
+
     base = AutoModelForSeq2SeqLM.from_pretrained(
         args.base_model, cache_dir=args.cache_dir
     )
@@ -176,13 +197,42 @@ def main():
     model = model.to(device)
     model.print_trainable_parameters()
 
-    prompt_generator, contriever = create_prompt_generator(
-        args.num_retrieved,
-        args.retriever,
-        args.ranked,
-        args.max_input_length,
-        tokenizer,
-    )
+    if args.prompt_style == "icl":
+
+        def prompt_generator(input_text, profile, task_inner):
+            row = {"input": input_text, "profile": profile or []}
+            return lamp_prompting.build_icl_source(
+                row,
+                tokenizer,
+                task=args.task,
+                max_tokens=args.max_input_length,
+                reserve_for_input=128,
+            )
+
+        contriever = None
+    elif args.task in ("SD-tooluse", "SD-science"):
+        sd_rag_one = lamp_prompting.build_rag_prompt_fn(
+            args.task,
+            tokenizer,
+            num_retrieved=args.num_retrieved,
+            retriever=args.retriever,
+            ranked=args.ranked,
+            max_length=args.max_input_length,
+        )
+
+        def prompt_generator(input_text, profile, task_inner):
+            row = {"input": input_text, "profile": profile or []}
+            return sd_rag_one(row)
+
+        contriever = None
+    else:
+        prompt_generator, contriever = create_prompt_generator(
+            args.num_retrieved,
+            args.retriever,
+            args.ranked,
+            args.max_input_length,
+            tokenizer,
+        )
     if contriever is not None:
         contriever = contriever.to(device)
 
@@ -206,6 +256,7 @@ def main():
         tokenizer=tokenizer, model=model, padding="longest", max_length=args.max_input_length
     )
     compute_metrics = build_compute_metrics(tokenizer)
+    is_sd = args.task in ("SD-tooluse", "SD-science")
 
     use_eval = val_hf is not None
     cuda = use_cuda
@@ -229,8 +280,10 @@ def main():
         save_strategy="epoch",
         eval_strategy="epoch" if use_eval else "no",
         load_best_model_at_end=use_eval,
-        metric_for_best_model="rouge-1" if use_eval else None,
-        greater_is_better=True if use_eval else None,
+        metric_for_best_model=(
+            "eval_loss" if (use_eval and is_sd) else ("rouge-1" if use_eval else None)
+        ),
+        greater_is_better=(False if (use_eval and is_sd) else (True if use_eval else None)),
         save_total_limit=2,
         seed=args.seed,
         report_to=[],
@@ -245,7 +298,7 @@ def main():
         eval_dataset=val_hf,
         processing_class=tokenizer,
         data_collator=collator,
-        compute_metrics=compute_metrics if use_eval else None,
+        compute_metrics=(compute_metrics if not is_sd else None),
     )
     trainer.train()
     trainer.save_model(args.output_dir)

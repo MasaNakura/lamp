@@ -17,7 +17,7 @@ After merge, **`data_io`** drops unusable examples for the given `--task`: **LaM
 
 | Path | Role |
 |------|------|
-| `train.py` | Optional supervised LoRA + RAG stage (checkpoint can be reused by **M3**). |
+| `train.py` | Optional supervised LoRA: **`--prompt_style icl`** (no retrieval; matches eval **M2**) or **`rag`** (default; retrieval-style for **M3** on SD, or LaMP’s generator). |
 | `run_evaluate.py` | **M1/M2/M3/M4** inference and metrics. |
 | `requirements.txt` | Python dependencies (includes **`higher`** for TTT-E2E meta-training). |
 | `data/` | Merge questions/outputs and infer user keys (`data_io.py`). |
@@ -80,10 +80,11 @@ For science, consider `--max_new_tokens 1024` (or higher) so the model can emit 
 
 ## Model stages (one supervised `train.py`)
 
-| Model | `train.py` (global LoRA + RAG) | `run_evaluate.py` |
-|-------|--------------------------------|----------------|
-| **M1, M2** | Skip | Base model; M2 uses long-context ICL. |
-| **M3** | Optional; use `--output_dir` as `--adapter_dir` if you train | **RAG** prompt at decode; if `--adapter_dir` is provided, loads the LoRA adapter, otherwise uses base model + RAG. |
+| Model | `train.py` (global LoRA) | `run_evaluate.py` |
+|-------|--------------------------|----------------|
+| **M1, M4** | Skip | Base model; M4 uses inner TTT only. |
+| **M2** | Optional; train with **`--prompt_style icl`** for ICL-aligned LoRA; same `--output_dir` as **`--adapter_dir`** | **ICL** encoder text; loads LoRA when set, else base. |
+| **M3** | Optional; train with **`--prompt_style rag`** (default on SD); use `--output_dir` as `--adapter_dir` if you train | **RAG** prompt at decode; if `--adapter_dir` is provided, loads the LoRA adapter, otherwise uses base model + RAG. |
 | **M4** | Skip (no global LoRA) | **TTT-E2E:** GPT-2 + `TTTGPT2` (`--architecture causal_lm`) or Flan-T5 + `TTTFlanT5` (`seq2seq`); shared `--m4_inner_window`, `--m4_inner_stride`, `--m4_profile_max_tokens`. Optional checkpoints from `train_mam_meta.py` (GPT-2) and `train_flan_meta.py` (Flan). |
 
 ## GPU (CUDA)
@@ -119,11 +120,11 @@ hf download google/flan-t5-small
 
 Use `--base_model <hub_id_or_local_path>` to switch models.
 
-## Train global LoRA + RAG (optional checkpoint for **M3**)
+## Train global LoRA (optional checkpoint for **M2** / **M3**)
 
 **Required:** `train_questions.json` + `train_outputs.json`. **Optional:** `dev_questions.json` + `dev_outputs.json` for validation each epoch and `load_best_model_at_end`; if you omit dev, training runs without evaluation loops (checkpoints are still saved each epoch).
 
-The `--output_dir` you pass here is the optional **`--adapter_dir`** for M3 in `run_evaluate.py`. Merged `merged_train.json` (and `merged_dev.json` when dev is set) are written under `--output_dir` for transparency.
+The `--output_dir` you pass here is the optional **`--adapter_dir`** for **M2** and **M3** in `run_evaluate.py`. Merged `merged_train.json` (and `merged_dev.json` when dev is set) are written under `--output_dir` for transparency.
 
 Replace `path/to/...` with real paths (relative paths resolve from your current working directory, usually the repo root).
 
@@ -148,6 +149,7 @@ python3 train.py --task LaMP-5 \
 ```
 
 - For **LaMP-7** (personalized tweet paraphrasing), use `--task LaMP-7` and your LaMP-7 paths; profile items use `text` (see upstream `LaMP/LaMP` prompts).
+- For **SD-tooluse** / **SD-science**, use `--task SD-tooluse` or `--task SD-science` with exported LaMP-style train JSON (same layout as `run_evaluate`). Use **`--prompt_style icl`** so training encoder text matches eval **M2** (no retrieval), or **`--prompt_style rag`** (default) to match eval **M3**. With dev data the best epoch is chosen by **eval_loss** (raise `--max_target_length` for long tool-use / science targets).
 - `--ranked` if profiles are pre-ranked (LaMP `merge_with_rank.py` workflow).
 - On **CUDA**, add e.g. `--fp16 --batch_size 8` (or `--bf16` on GPUs that support bfloat16) for faster steps than plain fp32.
 
@@ -171,6 +173,8 @@ python3 run_evaluate.py --task LaMP-5 \
 ```
 
 ### M2 — ICL
+
+Long-context ICL (serialized profile + task). Add **`--adapter_dir`** to load LoRA from **`train.py`**; for weights aligned with this mode, train with **`--prompt_style icl`** (encoder text is the same ICL packing as here, not the M3 RAG prompt).
 
 ```bash
 python3 run_evaluate.py --task LaMP-5 \
@@ -289,7 +293,7 @@ python3 run_evaluate.py --task LaMP-5 \
   --output_dir path/to/eval_out/all
 ```
 
-`--adapter_dir` is optional for `m3` and unused for `m1`, `m2`, and **`m4` in seq2seq mode**.
+`--adapter_dir` is optional for **`m2`** and **`m3`**; unused for **`m1`** and seq2seq **`m4`**.
 
 **Note:** You cannot mix **causal** M4 (`gpt2` + `TTTGPT2`) with **Flan** M1/M2/M3 in a single `run_evaluate.py` invocation, because `--base_model` and `--architecture` apply to the whole run. Run **TTT-E2E (GPT-2 M4)** as a separate command using the **M4 — TTT-E2E on LaMP-5 / LaMP-7** steps above.
 
@@ -312,5 +316,6 @@ python3 run_evaluate.py --task LaMP-5 \
 | `--cache_dir` | Hugging Face cache directory. |
 | `--max_users` | If set to `K` (>0), only rows belonging to the **first K distinct users** (in merged test file order) are evaluated—handy for debugging without the full split. |
 | `--verbose`, `--verbose_max_samples` | Print per-example inputs, profile counts, encoder preview, preds vs gold, and per-row BLEU/ROUGE/METEOR (cap rows with `verbose_max_samples`, `-1` = all). |
+| `--save_encoder_prompts` | After each mode, write `encoder_prompts_<mode>.json`: per-test `id`, raw `input`, full **encoder string** passed to `generate` for that mode (M1/M2/M3/M4), approximate token count, and prediction. |
 
 LaMP data and papers: `LaMP/README.md` (inside your clone) and [lamp-benchmark.github.io](https://lamp-benchmark.github.io/).

@@ -79,7 +79,8 @@ def build_icl_source(
     elif task == "LaMP-7":
         hist_chunks = [f'History tweet: "{p.get("text", "")}"' for p in prof]
     elif task in ("SD-tooluse", "SD-science"):
-        # Documentation / corpus lines (truncated from the left to fill encoder budget).
+        # Documentation lines: pack from the **end** of ``profile`` (lines near the task) backward
+        # into the remaining token budget so the instruction tail stays intact.
         hist_chunks = [(p.get("text") or "").strip() for p in prof if (p.get("text") or "").strip()]
     else:
         raise ValueError(task)
@@ -90,7 +91,7 @@ def build_icl_source(
         tok = tokenizer
         tail_ids = tok(tail, add_special_tokens=False, verbose=False)["input_ids"]
         sep_ids = tok(sep, add_special_tokens=False, verbose=False)["input_ids"]
-        min_doc_tokens = 32
+        min_doc_tokens = 16
         if len(tail_ids) + len(sep_ids) + min_doc_tokens > max_tokens:
             keep = max(64, max_tokens - len(sep_ids) - min_doc_tokens)
             tail = tok.decode(tail_ids[-keep:], skip_special_tokens=True)
