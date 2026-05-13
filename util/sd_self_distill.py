@@ -101,6 +101,92 @@ def sd_m2_preserving_tail(row: dict[str, Any], *, task: str) -> str:
     raise ValueError(f"sd_m2_preserving_tail: unknown task {task!r}")
 
 
+def _sd_tooluse_post_documentation_body(inp: str) -> str:
+    """Substring of ``inp`` after the first case-insensitive ``Documentation:`` marker."""
+    inp = (inp or "").replace("\r\n", "\n").strip()
+    low = inp.lower()
+    key = "documentation:"
+    idx = low.find(key)
+    if idx == -1:
+        return ""
+    return inp[idx + len(key) :].lstrip()
+
+
+def _truncate_tooluse_body_middle(tokenizer, body: str, max_tokens: int) -> str:
+    """
+    Fit ``body`` into ``max_tokens`` by keeping a **prefix** (tool definitions) and a
+    **suffix** (ideally from ``Question:`` / format block), dropping the middle.
+    """
+    ids = tokenizer(body, add_special_tokens=False, verbose=False)["input_ids"]
+    if len(ids) <= max_tokens:
+        return body
+    low = body.lower()
+    qidx = low.rfind("question:")
+    marker_tok = len(tokenizer("\n…\n", add_special_tokens=False, verbose=False)["input_ids"])
+    if qidx != -1 and qidx >= 40:
+        tail_text = body[qidx:].strip()
+        tail_ids = tokenizer(tail_text, add_special_tokens=False, verbose=False)["input_ids"]
+        head_budget = max_tokens - len(tail_ids) - marker_tok
+        if head_budget >= 48:
+            head_ids = ids[:head_budget]
+            return (
+                tokenizer.decode(head_ids, skip_special_tokens=True).rstrip()
+                + "\n…\n"
+                + tail_text
+            )
+    end_reserve = min(max_tokens // 2, 220)
+    start_reserve = max(48, max_tokens - end_reserve - 2)
+    end_reserve = max(32, max_tokens - start_reserve - 2)
+    head_ids = ids[:start_reserve]
+    tail_ids = ids[-end_reserve:]
+    return (
+        tokenizer.decode(head_ids, skip_special_tokens=True).rstrip()
+        + "\n…\n"
+        + tokenizer.decode(tail_ids, skip_special_tokens=True).lstrip()
+    )
+
+
+def build_sd_m2_tooluse_icl_encoder(
+    sample: dict[str, Any],
+    tokenizer,
+    *,
+    max_tokens: int,
+) -> str:
+    """
+    M2 encoder for **SD-tooluse**: preserved **header first** (through ``Documentation:``,
+    plus optional ``sd_rag_query`` per ``sd_m2_preserving_tail``), then the full
+    post-header text from ``input`` (all tools, format, question). When over budget,
+    truncate the **middle** of the post-header block so tool names / parameters near
+    the start and ``Question:`` / format near the end remain.
+    """
+    inp = (sample.get("input") or "").replace("\r\n", "\n").strip()
+    tail = sd_m2_preserving_tail(sample, task="SD-tooluse")
+    sep = "\n\n"
+    body = _sd_tooluse_post_documentation_body(inp)
+
+    def ntok(s: str) -> int:
+        return len(tokenizer(s, add_special_tokens=False, verbose=False)["input_ids"])
+
+    if not body:
+        return _truncate_ids(tokenizer, tail, max_tokens)
+
+    full = tail + sep + body
+    if ntok(full) <= max_tokens:
+        return full
+
+    sep_ids = tokenizer(sep, add_special_tokens=False, verbose=False)["input_ids"]
+    tail_ids = tokenizer(tail, add_special_tokens=False, verbose=False)["input_ids"]
+    if len(tail_ids) + len(sep_ids) >= max_tokens:
+        return _truncate_ids(tokenizer, tail, max_tokens)
+
+    body_budget = max(16, max_tokens - len(tail_ids) - len(sep_ids))
+    body_fit = _truncate_tooluse_body_middle(tokenizer, body, body_budget)
+    out = tail + sep + body_fit
+    if ntok(out) <= max_tokens:
+        return out
+    return _truncate_ids(tokenizer, out, max_tokens)
+
+
 def sd_ttt_inner_stream_text(
     urows: list[dict[str, Any]],
     prof_use: list[dict[str, Any]],

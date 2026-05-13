@@ -67,8 +67,13 @@ def build_icl_source(
     reserve_for_input: int = 128,
 ) -> str:
     """
-    Model 2 (ICL): concatenate serialized profile history, then the task input.
-    Truncates from the left of history to respect a Flan-T5-style length budget.
+    Model 2 (ICL): long-context encoder text from ``input`` + ``profile``.
+
+    **LaMP-5 / LaMP-7:** history chunks (profile) then the instance tail.
+    **SD-tooluse:** header first (through ``Documentation:`` via ``sd_m2_preserving_tail``),
+    then the full post-header tool documentation from ``input`` (all tools in that block),
+    truncating the **middle** only when over ``max_tokens``.
+    **SD-science:** preserved prefix first, then profile lines packed under budget.
     """
     prof = sample.get("profile") or []
     if task == "LaMP-5":
@@ -78,14 +83,14 @@ def build_icl_source(
         ]
     elif task == "LaMP-7":
         hist_chunks = [f'History tweet: "{p.get("text", "")}"' for p in prof]
-    elif task in ("SD-tooluse", "SD-science"):
-        # Documentation lines: pack from the **end** of ``profile`` (lines near the task) backward
-        # into the remaining token budget so the instruction tail stays intact.
+    elif task == "SD-tooluse":
+        return sd_self_distill.build_sd_m2_tooluse_icl_encoder(sample, tokenizer, max_tokens=max_tokens)
+    elif task == "SD-science":
         hist_chunks = [(p.get("text") or "").strip() for p in prof if (p.get("text") or "").strip()]
     else:
         raise ValueError(task)
 
-    if task in ("SD-tooluse", "SD-science"):
+    if task == "SD-science":
         tail = sd_self_distill.sd_m2_preserving_tail(sample, task=task)
         sep = "\n\n"
         tok = tokenizer
@@ -110,7 +115,8 @@ def build_icl_source(
             text_parts.append(chunk)
             budget -= len(ids)
         history = "\n".join(reversed(text_parts))
-        return (history + sep + tail).strip() if history.strip() else tail
+        # Read natural order: preserved system / task prefix first, then profile lines.
+        return (tail + sep + history).strip() if history.strip() else tail
 
     tail = "\n\nNow personalize for this instance:\n" + sample["input"]
     budget = max_tokens - len(
