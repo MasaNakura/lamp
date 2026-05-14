@@ -44,31 +44,40 @@ def write_encoder_prompts_json(
     tokenizer,
     max_in: int,
     encode_max_len: int,
-    rag_prompt: Callable[[dict], str],
-    model,
-    architecture: str,
+    rag_prompt: Callable[[dict], str] | None = None,
+    model=None,
+    architecture: str = "seq2seq",
     include_gold_output: bool = False,
+    encoder_text_fn: Callable[[dict], str] | None = None,
 ) -> None:
     """
     Write one JSON array aligned with eval ``encoder_prompts_<mode>.json``.
 
     If ``include_gold_output`` (training dump), each record also has ``gold_output`` from the row.
+
+    If ``encoder_text_fn`` is set, it supplies ``encoder_prompt`` per row (``rag_prompt`` / ``model`` are
+    ignored for encoding). Otherwise ``rag_prompt`` is required for ``encoder_source_for_seq2seq_mode``.
     """
     pred_map = dict(preds)
     lm = model if architecture == "seq2seq" else None
     recs: list[dict] = []
     for row in rows:
         rid = row["id"]
-        enc = encoder_source_for_seq2seq_mode(
-            mode,
-            row,
-            task=task,
-            tokenizer=tokenizer,
-            max_in=max_in,
-            rag_prompt=rag_prompt,
-            model=lm,
-            architecture=architecture,
-        )
+        if encoder_text_fn is not None:
+            enc = encoder_text_fn(row)
+        else:
+            if rag_prompt is None:
+                raise ValueError("write_encoder_prompts_json: pass rag_prompt or encoder_text_fn")
+            enc = encoder_source_for_seq2seq_mode(
+                mode,
+                row,
+                task=task,
+                tokenizer=tokenizer,
+                max_in=max_in,
+                rag_prompt=rag_prompt,
+                model=lm,
+                architecture=architecture,
+            )
         ntok = len(
             tokenizer.encode(
                 enc,
@@ -95,3 +104,30 @@ def write_encoder_prompts_json(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(recs, f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+def flan_meta_profile_stream_text(row: dict[str, Any], task: str, profile_rag: Any | None = None) -> str:
+    """
+    Profile-side text that ``train_flan_meta`` / ``ttt.flan_outer`` meta streams are built from
+    (flattened profile, optionally RAG-narrowed): same construction as ``meta_example_stream_lamp`` /
+    ``meta_example_stream_lamp_rag`` document strings.
+    """
+    from ttt.e2e import build_flat_history_stream
+    from util.sd_self_distill import sd_rag_query_for_row, sd_ttt_inner_stream_text
+
+    prof = row.get("profile") or []
+    if not isinstance(prof, list):
+        prof = []
+    use_prof = prof
+    if profile_rag is not None:
+        if task in ("SD-tooluse", "SD-science"):
+            q = sd_rag_query_for_row(row)
+        else:
+            q = (row.get("input") or "").strip()
+        if q:
+            picked = profile_rag.select(q, prof)
+            if picked:
+                use_prof = picked
+    if task in ("SD-tooluse", "SD-science"):
+        return sd_ttt_inner_stream_text([row], use_prof)
+    return build_flat_history_stream(task, use_prof)
