@@ -1,4 +1,4 @@
-"""Meta-training data: WikiText (MAM default) or LaMP profile streams (LaMP-5 / LaMP-7)."""
+"""Meta-training data: WikiText (default) or LaMP profile streams (LaMP-5 / LaMP-7)."""
 from __future__ import annotations
 
 import os

@@ -17,7 +17,7 @@ from tqdm import tqdm
 from .flan_inner import _tokenize_self_supervised_batch, inner_adapt_t5_functional
 from .flan_dual_mlp_model import TTTFlanT5
 from .lamp_profile_rag import LampProfileRAG
-from .mam_data import meta_example_stream, meta_example_stream_lamp, meta_example_stream_lamp_rag
+from .gpt2_data import meta_example_stream, meta_example_stream_lamp, meta_example_stream_lamp_rag
 
 
 def _atomic_torch_save(obj: object, path: str) -> None:

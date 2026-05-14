@@ -1,7 +1,7 @@
 """
 Meta-train TTT-E2E (outer loop) for GPT-2 with DualMLP on LaMP-5 profile text.
 
-Uses ``higher`` + ``ttt.mam_outer.run_lamp`` (same structure as the MAM reference).
+Uses ``higher`` + ``ttt.gpt2_outer.run_lamp`` (same structure as the MAM reference).
 Run from the repo root::
 
     py -3 train_mam_meta.py --task LaMP-5 \\
@@ -28,7 +28,7 @@ if _DATA_DIR not in sys.path:
 import data_io  # noqa: E402
 import torch  # noqa: E402
 
-from ttt.mam_outer import run_lamp  # noqa: E402
+from ttt.gpt2_outer import run_lamp  # noqa: E402
 
 
 def parse_args():

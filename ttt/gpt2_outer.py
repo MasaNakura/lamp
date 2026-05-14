@@ -14,9 +14,9 @@ import higher
 import torch
 from tqdm import tqdm
 
-from .mam_data import meta_example_stream, meta_example_stream_lamp
-from .mam_inner import inner_adapt_functional
-from .mam_model import TTTGPT2
+from .gpt2_data import meta_example_stream, meta_example_stream_lamp
+from .gpt2_inner import inner_adapt_functional
+from .gpt2_model import TTTGPT2
 
 
 def _meta_step(
@@ -175,7 +175,7 @@ def run_lamp(
         pbar.set_postfix(loss=f"{loss_v:.3f}", ema=f"{ema_loss:.3f}")
         if log_every > 0 and ((step + 1) % log_every == 0 or step == 0 or step == meta_steps - 1):
             print(
-                f"[meta-train mam lamp] step={step + 1}/{meta_steps} "
+                f"[meta-train gpt2 lamp] step={step + 1}/{meta_steps} "
                 f"loss={loss_v:.4f} ema={ema_loss:.4f} elapsed_s={elapsed:.1f}"
             )
 

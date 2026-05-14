@@ -21,7 +21,7 @@ Models (paper storyboard):
   packs them under ``--max_input_length``, then appends ``Task:`` + full ``input`` (truncated
   only if still too long).
   M4 TTT-E2E: seq2seq uses ``ttt/flan_inner.py`` with ``TTTFlanT5`` Dual-FFN wrapper (single-pass sliding inner; shared ``--m4_*`` flags with causal GPT-2 M4). Optional ``--m4_use_rag``: per test row, retrieve top‑K history (M3 retriever flags), run sliding-window inner TTT on that text, then generate from that row's ``input``.
-  Causal GPT-2 uses ``ttt/mam_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m4_checkpoint``). No global LoRA.
+  Causal GPT-2 uses ``ttt/gpt2_*.py`` (DualMLP + ``inner_adapt_inplace``; optional ``--m4_checkpoint``). No global LoRA.
 
 Metrics follow LaMP/LaMP/metrics/generation_metrics.py (BLEU, ROUGE, METEOR).
 """
@@ -117,7 +117,7 @@ def parse_args():
     p.add_argument(
         "--modes",
         default="m1,m2,m3,m4",
-        help="Comma list among m1,m2,m3,m4 (m4 = TTT-E2E-style inner: Flan ``flan_inner`` or GPT-2 ``mam_inner``; base model).",
+        help="Comma list among m1,m2,m3,m4 (m4 = TTT-E2E-style inner: Flan ``flan_inner`` or GPT-2 ``gpt2_inner``; base model).",
     )
     p.add_argument(
         "--cache_dir",
@@ -572,7 +572,7 @@ def run_for_mode(
                 f"Causal LM (--architecture causal_lm or a gpt2 base_model) supports m1 and m4 only; got {mode=!r}."
             )
         if mode == "m4":
-            from ttt.mam_model import TTTGPT2
+            from ttt.gpt2_model import TTTGPT2
 
             model = TTTGPT2(base_model_name, ttt_fraction=0.25)
             if m4_checkpoint:
@@ -713,7 +713,7 @@ def run_for_mode(
     if mode == "m4":
         if architecture == "causal_lm":
             from ttt import e2e as ttt_e2e
-            from ttt.mam_inner import inner_adapt_inplace
+            from ttt.gpt2_inner import inner_adapt_inplace
 
             prof_cap = _m4_profile_token_cap(max_in, m4_profile_max_tokens, task)
 
